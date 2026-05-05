@@ -27,10 +27,11 @@ Cargo workspace, three crates:
 
 | crate | what it owns |
 |---|---|
-| `forge-core` | step types, hashes, graph invariants, `Agent` and `Matcher` traits |
-| `forge-storage` | `Storage` trait + in-memory / sled / Postgres backends |
-| `forge-anthropic` | Anthropic Messages API adapter (single-shot for now) |
-| `forge-cli` | the `forge` binary (`run`, `replay`, `runs`, `fork`, `diff`) |
+| `forge-core` | step types, hashes, graph invariants, `Agent` / `Matcher` / `Tool` traits |
+| `forge-storage` | `Storage` trait, `MemoryStorage`, `SledStorage` |
+| `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use) |
+| `forge-openai` | OpenAI Chat Completions adapter (multi-turn tool use) |
+| `forge-cli` | the `forge` binary (`run`, `runs`, `replay`, `continue`, `fork`, `diff`) |
 
 Storage backends planned: in-memory (done), sled, Postgres (single source of truth, durable resume).
 
@@ -50,6 +51,9 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Fork supports every step kind (text for prompt/message, JSON for tool_call/tool_result)
 - [x] Auto-execute tool after fork-on-tool-call when `--continue` is set
 - [x] `forge continue <run>` + `--max-turns` on run/continue/fork — mid-run model handoffs
+- [x] OpenAI Chat Completions adapter (`--agent openai`)
+- [x] Cross-provider continuations: run with Claude, continue with GPT-5
+- [x] Friendly error rendering (no Rust backtrace on missing API key)
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -67,6 +71,10 @@ forge run --agent fake
 # real Anthropic call with tool use
 export ANTHROPIC_API_KEY=...
 forge run --agent anthropic --tools calculator --prompt "what is 47 * 53?"
+
+# OpenAI works the same way
+export OPENAI_API_KEY=...
+forge run --agent openai --model gpt-5 --tools calculator --prompt "what is 47 * 53?"
 
 # list recorded runs
 forge runs

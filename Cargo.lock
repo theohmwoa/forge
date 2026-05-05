@@ -306,6 +306,7 @@ dependencies = [
  "clap",
  "forge-anthropic",
  "forge-core",
+ "forge-openai",
  "forge-storage",
  "serde_json",
  "tokio",
@@ -338,6 +339,20 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "forge-openai"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "forge-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

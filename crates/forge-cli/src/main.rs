@@ -12,6 +12,7 @@ use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
 use forge_core::tool::{Calculator, Tool};
 use forge_core::{NodeHash, Step};
+use forge_openai::{OpenAIAgent, OpenAIConfig};
 use forge_storage::{RunMeta, SledStorage, Storage};
 
 #[derive(Parser)]
@@ -94,6 +95,69 @@ enum Cmd {
 enum AgentKind {
     Fake,
     Anthropic,
+    Openai,
+}
+
+fn build_fresh_agent(
+    kind: AgentKind,
+    prompt: Option<String>,
+    model: String,
+    tools: Vec<Arc<dyn Tool>>,
+    max_turns: Option<usize>,
+) -> anyhow::Result<Box<dyn Agent>> {
+    match kind {
+        AgentKind::Fake => Ok(Box::new(FakeAgent::scripted())),
+        AgentKind::Anthropic => {
+            let prompt = prompt
+                .ok_or_else(|| anyhow::anyhow!("--prompt is required for --agent anthropic"))?;
+            let cfg = AnthropicConfig::from_env(model)?;
+            let mut a = AnthropicAgent::new(cfg, prompt).with_tools(tools);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
+        AgentKind::Openai => {
+            let prompt =
+                prompt.ok_or_else(|| anyhow::anyhow!("--prompt is required for --agent openai"))?;
+            let cfg = OpenAIConfig::from_env(model)?;
+            let mut a = OpenAIAgent::new(cfg, prompt).with_tools(tools);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
+    }
+}
+
+fn build_continuing_agent(
+    kind: AgentKind,
+    prefix: &[Step],
+    model: String,
+    tools: Vec<Arc<dyn Tool>>,
+    max_turns: Option<usize>,
+) -> anyhow::Result<Box<dyn Agent>> {
+    match kind {
+        AgentKind::Fake => {
+            anyhow::bail!("--continue does not support --agent fake; use anthropic or openai")
+        }
+        AgentKind::Anthropic => {
+            let cfg = AnthropicConfig::from_env(model)?;
+            let mut a = AnthropicAgent::continuing(cfg, prefix).with_tools(tools);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
+        AgentKind::Openai => {
+            let cfg = OpenAIConfig::from_env(model)?;
+            let mut a = OpenAIAgent::continuing(cfg, prefix).with_tools(tools);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -111,11 +175,22 @@ fn build_tools(kinds: &[ToolKind]) -> Vec<Arc<dyn Tool>> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if let Err(err) = run().await {
+        eprintln!("forge: {err}");
+        let mut source = err.source();
+        while let Some(s) = source {
+            eprintln!("  caused by: {s}");
+            source = s.source();
+        }
+        std::process::exit(1);
+    }
+}
 
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let storage = SledStorage::open(&cli.db)?;
 
@@ -128,20 +203,7 @@ async fn main() -> anyhow::Result<()> {
             max_turns,
         } => {
             let tool_set = build_tools(&tools);
-            let mut agent: Box<dyn Agent> = match agent {
-                AgentKind::Fake => Box::new(FakeAgent::scripted()),
-                AgentKind::Anthropic => {
-                    let prompt = prompt.ok_or_else(|| {
-                        anyhow::anyhow!("--prompt is required for --agent anthropic")
-                    })?;
-                    let cfg = AnthropicConfig::from_env(model)?;
-                    let mut a = AnthropicAgent::new(cfg, prompt).with_tools(tool_set);
-                    if let Some(n) = max_turns {
-                        a = a.with_max_turns(n);
-                    }
-                    Box::new(a)
-                }
-            };
+            let mut agent = build_fresh_agent(agent, prompt, model, tool_set, max_turns)?;
             let chain = run_agent(agent.as_mut(), &storage).await?;
             if chain.is_empty() {
                 anyhow::bail!("agent emitted no steps; nothing to record");
@@ -190,18 +252,16 @@ async fn main() -> anyhow::Result<()> {
             tools,
             max_turns,
         } => {
-            if !matches!(agent, AgentKind::Anthropic) {
-                anyhow::bail!("forge continue currently requires --agent anthropic");
-            }
             let head = resolve_head(&storage, &run)?;
             let prefix_steps: Vec<Step> = storage.chain_to(&head)?;
-            let cfg = AnthropicConfig::from_env(model)?;
-            let mut cont =
-                AnthropicAgent::continuing(cfg, &prefix_steps).with_tools(build_tools(&tools));
-            if let Some(n) = max_turns {
-                cont = cont.with_max_turns(n);
-            }
-            let appended = run_agent_from(Some(head.clone()), &mut cont, &storage).await?;
+            let mut cont = build_continuing_agent(
+                agent,
+                &prefix_steps,
+                model,
+                build_tools(&tools),
+                max_turns,
+            )?;
+            let appended = run_agent_from(Some(head.clone()), cont.as_mut(), &storage).await?;
             if appended.is_empty() {
                 anyhow::bail!("agent emitted no new steps; nothing to record");
             }
@@ -250,9 +310,6 @@ async fn main() -> anyhow::Result<()> {
             let prefix_len_before_continue = new_chain.len();
 
             if r#continue {
-                if !matches!(agent, AgentKind::Anthropic) {
-                    anyhow::bail!("--continue currently requires --agent anthropic");
-                }
                 let prefix_steps: Vec<Step> = {
                     let mut acc = Vec::with_capacity(new_chain.len());
                     for h in &new_chain {
@@ -265,12 +322,9 @@ async fn main() -> anyhow::Result<()> {
                     acc
                 };
                 let last_hash = new_chain.last().cloned().unwrap();
-                let cfg = AnthropicConfig::from_env(model)?;
-                let mut cont = AnthropicAgent::continuing(cfg, &prefix_steps).with_tools(tool_set);
-                if let Some(n) = max_turns {
-                    cont = cont.with_max_turns(n);
-                }
-                let appended = run_agent_from(Some(last_hash), &mut cont, &storage).await?;
+                let mut cont =
+                    build_continuing_agent(agent, &prefix_steps, model, tool_set, max_turns)?;
+                let appended = run_agent_from(Some(last_hash), cont.as_mut(), &storage).await?;
                 new_chain.extend(appended);
             }
 
