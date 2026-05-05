@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Core types for Forge: content-addressed agent run graphs."
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }

@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod agent;
+pub mod tool;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeHash(pub String);

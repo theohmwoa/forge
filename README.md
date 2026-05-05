@@ -43,7 +43,8 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `Matcher` trait sketch (interception / tripwires)
 - [x] `forge fork <run> --at <step> --rewrite-text` (Prompt/Message kinds)
 - [x] `forge diff` v0: pairwise chain walk, finds first divergence
-- [ ] Anthropic tool-use loop (multi-turn, tool calls round-tripped)
+- [x] Anthropic tool-use loop (multi-turn, tool calls executed locally)
+- [x] `Tool` trait + built-in `Calculator` tool
 - [ ] `forge fork ... --continue` — drive a fresh agent forward from the fork
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
@@ -59,9 +60,9 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 # record a 5-step scripted run (no API key required)
 forge run --agent fake
 
-# real Anthropic call (single-shot, no tools yet)
+# real Anthropic call with tool use
 export ANTHROPIC_API_KEY=...
-forge run --agent anthropic --prompt "what is 2 + 2"
+forge run --agent anthropic --tools calculator --prompt "what is 47 * 53?"
 
 # list recorded runs
 forge runs

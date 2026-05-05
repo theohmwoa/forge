@@ -3,9 +3,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use std::sync::Arc;
+
 use forge::{diff_chains, fork_chain, print_chain, render_diff, run_agent};
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
+use forge_core::tool::{Calculator, Tool};
 use forge_core::NodeHash;
 use forge_storage::{RunMeta, SledStorage};
 
@@ -30,6 +33,9 @@ enum Cmd {
         prompt: Option<String>,
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
+        /// Tools to expose to the agent. Repeat or comma-separate.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        tools: Vec<ToolKind>,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay { head: String },
@@ -56,6 +62,20 @@ enum AgentKind {
     Anthropic,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ToolKind {
+    Calculator,
+}
+
+fn build_tools(kinds: &[ToolKind]) -> Vec<Arc<dyn Tool>> {
+    kinds
+        .iter()
+        .map(|k| match k {
+            ToolKind::Calculator => Arc::new(Calculator) as Arc<dyn Tool>,
+        })
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -70,7 +90,9 @@ async fn main() -> anyhow::Result<()> {
             agent,
             prompt,
             model,
+            tools,
         } => {
+            let tool_set = build_tools(&tools);
             let mut agent: Box<dyn Agent> = match agent {
                 AgentKind::Fake => Box::new(FakeAgent::scripted()),
                 AgentKind::Anthropic => {
@@ -78,7 +100,8 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::anyhow!("--prompt is required for --agent anthropic")
                     })?;
                     let cfg = AnthropicConfig::from_env(model)?;
-                    Box::new(AnthropicAgent::new(cfg, prompt))
+                    let agent = AnthropicAgent::new(cfg, prompt).with_tools(tool_set);
+                    Box::new(agent)
                 }
             };
             let chain = run_agent(agent.as_mut(), &storage).await?;
