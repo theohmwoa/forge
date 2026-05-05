@@ -7,8 +7,8 @@ mod tui;
 mod web;
 
 use forge::{
-    auto_run_tool_after_fork, diff_chains, fork_chain, print_chain, render_diff, run_agent,
-    run_agent_from,
+    auto_run_tool_after_fork, bisect_chains, default_bisect_check, diff_chains, fork_chain,
+    print_chain, render_bisect, render_diff, run_agent, run_agent_from,
 };
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
@@ -112,6 +112,33 @@ enum Cmd {
     },
     /// Diff two recorded runs by walking their chains pairwise.
     Diff { a: String, b: String },
+    /// `git bisect` for agent runs. Given a `good` run that succeeded and a
+    /// `bad` run that failed, walk the divergent tail of `bad` and substitute
+    /// each step in turn with the corresponding step from `good`. Report the
+    /// first step where the substitution makes the run succeed — that is the
+    /// step that caused the failure.
+    Bisect {
+        /// A run that satisfies the success criterion.
+        good: String,
+        /// A run that does not.
+        bad: String,
+        /// Agent to drive the replay forward from each fork.
+        #[arg(long, value_enum, default_value_t = AgentKind::Anthropic)]
+        agent: AgentKind,
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+        #[arg(long, value_enum, value_delimiter = ',')]
+        tools: Vec<ToolKind>,
+        /// Cap on per-trial agent turns. Bisects can be expensive; keep low.
+        #[arg(long, default_value_t = 4)]
+        max_turns: usize,
+        /// Substring the final assistant message must contain for a trial to
+        /// be considered "recovered". Defaults to "ends in any non-empty
+        /// assistant message" — useful when bad's failure mode is aborting
+        /// rather than answering wrong.
+        #[arg(long)]
+        expect: Option<String>,
+    },
     /// Open a TUI viewer for a single run, or pass `--diff` to view aligned
     /// diff between two runs.
     View {
@@ -454,6 +481,70 @@ async fn run() -> anyhow::Result<()> {
             println!("new head: {new_head}");
             println!("--- dag ---");
             print_chain(&*storage, &new_chain).await?;
+        }
+        Cmd::Bisect {
+            good,
+            bad,
+            agent,
+            model,
+            tools,
+            max_turns,
+            expect,
+        } => {
+            let head_good = resolve_head(&*storage, &good).await?;
+            let head_bad = resolve_head(&*storage, &bad).await?;
+            let chain_good = storage.chain_to(&head_good).await?;
+            let chain_bad = storage.chain_to(&head_bad).await?;
+
+            let tool_set = build_tools(&tools);
+            let agent_kind = agent;
+            let model_for_agent = model.clone();
+            let tools_for_agent = tool_set.clone();
+            let max_t = max_turns;
+            let build_agent = move |prefix: &[Step]| -> anyhow::Result<Box<dyn Agent>> {
+                build_continuing_agent(
+                    agent_kind,
+                    prefix,
+                    model_for_agent.clone(),
+                    tools_for_agent.clone(),
+                    Some(max_t),
+                )
+            };
+
+            // Default check vs substring check.
+            let check_substring = expect.clone();
+            let result = match check_substring {
+                Some(needle) => {
+                    let needle_owned = needle.clone();
+                    let check = move |steps: &[Step]| {
+                        steps.last().is_some_and(|s| match &s.kind {
+                            forge_core::StepKind::Message { role, content } => {
+                                role == "assistant" && content.contains(&needle_owned)
+                            }
+                            _ => false,
+                        })
+                    };
+                    bisect_chains(&*storage, &chain_good, &chain_bad, build_agent, check).await?
+                }
+                None => {
+                    bisect_chains(
+                        &*storage,
+                        &chain_good,
+                        &chain_bad,
+                        build_agent,
+                        default_bisect_check,
+                    )
+                    .await?
+                }
+            };
+
+            println!(
+                "good: {}  ({} steps)",
+                short(&head_good.0),
+                chain_good.len()
+            );
+            println!("bad:  {}  ({} steps)", short(&head_bad.0), chain_bad.len());
+            print!("{}", render_bisect(&result));
         }
         Cmd::Diff { a, b } => {
             let head_a = resolve_head(&*storage, &a).await?;

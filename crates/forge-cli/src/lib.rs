@@ -1,11 +1,11 @@
-//! Runtime helpers for the `forge` CLI: run, fork, and diff over the run
-//! graph.
+//! Runtime helpers for the `forge` CLI: run, fork, diff, and bisect over the
+//! run graph.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use forge_core::agent::Agent;
 use forge_core::{NodeHash, Step, StepKind};
-use forge_storage::Storage;
+use forge_storage::{RunMeta, Storage};
 
 /// Drive `agent` to completion, persisting every step into `storage`.
 /// Returns the chain of node hashes in emission order.
@@ -376,9 +376,263 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// -- bisect ----------------------------------------------------------------
+//
+// `git bisect` for agent runs. Given two chains that share a prefix — one
+// that succeeds (`good`) and one that fails (`bad`) — walk the divergent
+// tail step-by-step. At each substitutable divergence, fork `bad` at that
+// step replacing the value with `good`'s, run the agent forward, and ask:
+// did it recover? The first step where forking → success is the step that
+// caused the failure.
+//
+// Distinct from `forge diff`: diff *describes* divergence, bisect *isolates
+// causation*. Distinct from cassette-based replay: only possible because
+// Forge's content-addressed graph makes per-step forks free.
+
+#[derive(Debug, Clone)]
+pub struct BisectOutcome {
+    /// Index in the *bad* chain at which we forked.
+    pub bad_index: usize,
+    pub bad_step: Step,
+    pub good_step: Step,
+    /// Head of the chain produced by forking bad at `bad_index` with
+    /// `good_step`'s content and replaying forward.
+    pub fork_head: NodeHash,
+    pub recovered: bool,
+    /// Last assistant message text in the forked chain, if any. Useful for
+    /// the rendering layer.
+    pub final_text: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BisectResult {
+    pub common_prefix_len: usize,
+    pub trials: Vec<BisectOutcome>,
+    /// Index into `trials` of the first step that, when substituted with
+    /// `good`'s value, made the run succeed. `None` if no single
+    /// substitution recovered the run (multiple things broke, or the check
+    /// is too strict).
+    pub first_recoverable: Option<usize>,
+}
+
+/// Default success criterion: chain ends with a non-empty `assistant`
+/// message. Pass a custom `check` to `bisect_chains` for tighter assertions
+/// (e.g. substring match against `good`'s answer).
+pub fn default_bisect_check(steps: &[Step]) -> bool {
+    steps.last().is_some_and(|s| match &s.kind {
+        StepKind::Message { role, content } => role == "assistant" && !content.trim().is_empty(),
+        _ => false,
+    })
+}
+
+/// Walk the divergent tail of `chain_bad`. At each step where `bad` and
+/// `good` have substitutable kinds, fork the bad chain at that step with
+/// `good`'s value, run the agent forward, and check if the result passes.
+///
+/// `build_agent` is called once per trial with the rewritten prefix so the
+/// caller can construct a *continuing* agent (Anthropic, OpenAI, Gemini, or
+/// a test fake) bound to that prefix's history.
+///
+/// Bisect stops at the first recovered trial — the tweet-worthy case is one
+/// step; if you need an exhaustive scan, call this once per substitutable
+/// divergence with `take_until_recovered = false`. (Not yet exposed; the
+/// internal walk hits the first recoverable step and returns.)
+pub async fn bisect_chains<S, AgentBuilder, Check>(
+    storage: &S,
+    chain_good: &[Step],
+    chain_bad: &[Step],
+    mut build_agent: AgentBuilder,
+    check: Check,
+) -> anyhow::Result<BisectResult>
+where
+    S: Storage + ?Sized,
+    AgentBuilder: FnMut(&[Step]) -> anyhow::Result<Box<dyn Agent>>,
+    Check: Fn(&[Step]) -> bool,
+{
+    // Length of the content-addressed shared prefix.
+    let mut common = 0;
+    for (a, b) in chain_good.iter().zip(chain_bad.iter()) {
+        if a.id == b.id {
+            common += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Sanity: the bad run shouldn't already pass and the good run should.
+    // We don't bail on these — print as warnings via tracing and let the
+    // caller decide — but they often indicate a misconfigured `--expect`.
+    if check(chain_bad) {
+        tracing::warn!("bisect: the BAD chain already satisfies the check; nothing to bisect");
+    }
+    if !check(chain_good) {
+        tracing::warn!("bisect: the GOOD chain doesn't satisfy the check — bisect may be vacuous");
+    }
+
+    let mut trials: Vec<BisectOutcome> = Vec::new();
+    let mut first_recoverable: Option<usize> = None;
+
+    let walk_end = chain_bad.len().min(chain_good.len());
+    let chain_bad_owned: Vec<Step> = chain_bad.to_vec();
+
+    for i in common..walk_end {
+        let bad_step = chain_bad[i].clone();
+        let good_step = chain_good[i].clone();
+
+        // Substitution requires matching kind shapes — otherwise the rewrite
+        // can't be interpreted correctly (text vs JSON, etc).
+        if !same_kind_signature(&bad_step.kind, &good_step.kind) {
+            continue;
+        }
+
+        // Use the full hash so fork_chain doesn't accidentally match a
+        // different step at the same prefix.
+        let rewrite = step_rewrite_content(&good_step);
+        let new_chain = fork_chain(storage, &chain_bad_owned, &bad_step.id.0, &rewrite).await?;
+
+        let mut prefix_steps: Vec<Step> = Vec::with_capacity(new_chain.len());
+        for h in &new_chain {
+            let s = storage
+                .get(h)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("forked step missing: {h}"))?;
+            prefix_steps.push(s);
+        }
+        let last_hash = new_chain.last().cloned().unwrap();
+
+        // Drive the agent forward from the rewritten step. The agent's own
+        // `max_turns` cap (set up by the caller) bounds runtime.
+        let mut agent = build_agent(&prefix_steps)?;
+        let appended = run_agent_from(Some(last_hash.clone()), agent.as_mut(), storage).await?;
+
+        let mut all_steps = prefix_steps.clone();
+        for h in &appended {
+            let s = storage
+                .get(h)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("appended step missing: {h}"))?;
+            all_steps.push(s);
+        }
+
+        let recovered = check(&all_steps);
+        let final_text = all_steps.last().and_then(|s| match &s.kind {
+            StepKind::Message { role, content } if role == "assistant" => Some(content.clone()),
+            _ => None,
+        });
+
+        let fork_head = appended.last().cloned().unwrap_or(last_hash);
+
+        // Persist the trial so users can `forge view` / `forge web` it later.
+        // Tagged so they're easy to filter or clean up.
+        let root = chain_bad_owned[0].id.clone();
+        let _ = storage
+            .record_run(&RunMeta {
+                head: fork_head.clone(),
+                root,
+                recorded_at_ms: now_ms(),
+                tag: Some(format!("bisect-step-{i}")),
+            })
+            .await;
+
+        trials.push(BisectOutcome {
+            bad_index: i,
+            bad_step,
+            good_step,
+            fork_head,
+            recovered,
+            final_text,
+        });
+
+        if recovered {
+            first_recoverable = Some(trials.len() - 1);
+            break;
+        }
+    }
+
+    Ok(BisectResult {
+        common_prefix_len: common,
+        trials,
+        first_recoverable,
+    })
+}
+
+fn same_kind_signature(a: &StepKind, b: &StepKind) -> bool {
+    use StepKind::*;
+    matches!(
+        (a, b),
+        (Prompt { .. }, Prompt { .. })
+            | (Message { .. }, Message { .. })
+            | (ToolCall { .. }, ToolCall { .. })
+            | (ToolResult { .. }, ToolResult { .. })
+    )
+}
+
+fn step_rewrite_content(step: &Step) -> String {
+    match &step.kind {
+        StepKind::Prompt { content, .. } => content.clone(),
+        StepKind::Message { content, .. } => content.clone(),
+        StepKind::ToolCall { input, .. } => input.to_string(),
+        StepKind::ToolResult { output, .. } => output.to_string(),
+    }
+}
+
+pub fn render_bisect(result: &BisectResult) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "shared prefix: {} step(s)\n",
+        result.common_prefix_len
+    ));
+    out.push_str(&format!("trials run:    {}\n\n", result.trials.len()));
+
+    for t in &result.trials {
+        let marker = if t.recovered {
+            "RECOVERED"
+        } else {
+            "still failed"
+        };
+        out.push_str(&format!(
+            "  step {:>2}  {:<24}  {}\n",
+            t.bad_index,
+            label(&t.bad_step.kind),
+            marker
+        ));
+        if t.recovered {
+            if let Some(text) = &t.final_text {
+                let head: String = text.lines().next().unwrap_or("").chars().take(80).collect();
+                out.push_str(&format!("            final: {head}\n"));
+            }
+        }
+    }
+
+    out.push('\n');
+    if let Some(idx) = result.first_recoverable {
+        let t = &result.trials[idx];
+        out.push_str(&format!(
+            "first recoverable divergence: step {} ({})\n",
+            t.bad_index,
+            label(&t.bad_step.kind)
+        ));
+        out.push_str(&format!("  bad:  {}\n", brief(&t.bad_step.kind)));
+        out.push_str(&format!("  good: {}\n", brief(&t.good_step.kind)));
+        out.push_str(&format!("  fork: {}\n", short(&t.fork_head.0)));
+        out.push('\n');
+        out.push_str(
+            "the bad value at this step prevented recovery; substituting good's value succeeded.\n",
+        );
+    } else {
+        out.push_str("no single substitution recovered the run.\n");
+        out.push_str(
+            "multiple steps may be implicated, or the check is too strict for the agent.\n",
+        );
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use forge_core::StepKind;
     use forge_storage::MemoryStorage;
 
@@ -386,6 +640,45 @@ mod tests {
         StepKind::Message {
             role: role.into(),
             content: content.into(),
+        }
+    }
+
+    type RespondFn = Box<dyn FnMut(&[Step]) -> String + Send>;
+
+    /// Test-only agent: emits one assistant message whose content depends on
+    /// the prefix it sees. Exposes a closure so individual tests can pin the
+    /// behavior they want.
+    struct ScriptedAgent {
+        respond: RespondFn,
+        prefix: Vec<Step>,
+        emitted: bool,
+    }
+
+    impl ScriptedAgent {
+        fn new(prefix: Vec<Step>, respond: impl FnMut(&[Step]) -> String + Send + 'static) -> Self {
+            Self {
+                respond: Box::new(respond),
+                prefix,
+                emitted: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Agent for ScriptedAgent {
+        async fn next_step(&mut self, _parent: Option<NodeHash>) -> Option<StepKind> {
+            if self.emitted {
+                return None;
+            }
+            self.emitted = true;
+            let content = (self.respond)(&self.prefix);
+            if content.is_empty() {
+                return None; // closure returning "" means "say nothing".
+            }
+            Some(StepKind::Message {
+                role: "assistant".into(),
+                content,
+            })
         }
     }
 
@@ -626,5 +919,224 @@ mod tests {
         assert_eq!(pairs[1], (Some(1), None));
         assert_eq!(pairs[2], (Some(2), None));
         assert_eq!(pairs[3], (Some(3), None));
+    }
+
+    #[tokio::test]
+    async fn bisect_finds_step_that_caused_failure() {
+        let storage = MemoryStorage::new();
+
+        // good: prompt -> assistant("Paris is the capital of France.")
+        let good = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "What is the capital of France?".into(),
+                },
+                msg("assistant", "Paris is the capital of France."),
+            ],
+        )
+        .await;
+
+        // bad: SAME prompt, but assistant got it wrong.
+        // Different content at index 1 produces a different hash, so the
+        // chains share a 1-step prefix (the prompt) and diverge at step 1.
+        let bad = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "What is the capital of France?".into(),
+                },
+                msg("assistant", "Lyon."),
+            ],
+        )
+        .await;
+
+        // Sanity: shared prefix is the prompt only.
+        assert_eq!(good[0].id, bad[0].id);
+        assert_ne!(good[1].id, bad[1].id);
+
+        // Build agent that, after we fork bad with good's content, doesn't
+        // need to do anything — the chain already ends in a Message. So
+        // build_agent returns an "emit nothing" agent.
+        let build_agent = |_prefix: &[Step]| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| String::new())) as Box<dyn Agent>)
+        };
+
+        // Custom check: the answer must contain "Paris".
+        let check = |steps: &[Step]| {
+            steps.last().is_some_and(|s| match &s.kind {
+                StepKind::Message { role, content } => {
+                    role == "assistant" && content.contains("Paris")
+                }
+                _ => false,
+            })
+        };
+
+        let result = bisect_chains(&storage, &good, &bad, build_agent, check)
+            .await
+            .unwrap();
+
+        assert_eq!(result.common_prefix_len, 1);
+        assert_eq!(result.trials.len(), 1);
+        assert!(result.trials[0].recovered);
+        assert_eq!(result.trials[0].bad_index, 1);
+        assert_eq!(result.first_recoverable, Some(0));
+    }
+
+    #[tokio::test]
+    async fn bisect_skips_steps_with_mismatched_kinds() {
+        let storage = MemoryStorage::new();
+
+        let good = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "go".into(),
+                },
+                StepKind::ToolCall {
+                    call_id: "t1".into(),
+                    name: "calc".into(),
+                    input: serde_json::json!({"a": 1}),
+                },
+                msg("assistant", "done"),
+            ],
+        )
+        .await;
+
+        // bad has a Message at index 1 where good has a ToolCall — kinds
+        // differ, so bisect should skip step 1, walk to step 2 (Message vs
+        // Message), substitute, and recover.
+        let bad = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "go".into(),
+                },
+                msg("assistant", "I refuse to use a tool"),
+                msg("assistant", "wrong final"),
+            ],
+        )
+        .await;
+
+        let build_agent = |_prefix: &[Step]| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| String::new())) as Box<dyn Agent>)
+        };
+        let check = |steps: &[Step]| {
+            steps.last().is_some_and(|s| match &s.kind {
+                StepKind::Message { role, content } => role == "assistant" && content == "done",
+                _ => false,
+            })
+        };
+
+        let result = bisect_chains(&storage, &good, &bad, build_agent, check)
+            .await
+            .unwrap();
+        // Step 1 was skipped (ToolCall vs Message), step 2 substituted.
+        assert_eq!(result.trials.len(), 1);
+        assert_eq!(result.trials[0].bad_index, 2);
+        assert!(result.trials[0].recovered);
+    }
+
+    #[tokio::test]
+    async fn bisect_reports_no_recovery_when_no_substitution_helps() {
+        let storage = MemoryStorage::new();
+
+        let good = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "go".into(),
+                },
+                msg("assistant", "good answer"),
+            ],
+        )
+        .await;
+        let bad = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "go".into(),
+                },
+                msg("assistant", "bad answer"),
+            ],
+        )
+        .await;
+
+        // Agent does nothing; check requires impossible content.
+        let build_agent = |_prefix: &[Step]| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| String::new())) as Box<dyn Agent>)
+        };
+        let check = |steps: &[Step]| {
+            steps.last().is_some_and(|s| match &s.kind {
+                StepKind::Message { role, content } => {
+                    role == "assistant" && content.contains("THIS WILL NEVER MATCH")
+                }
+                _ => false,
+            })
+        };
+
+        let result = bisect_chains(&storage, &good, &bad, build_agent, check)
+            .await
+            .unwrap();
+        assert_eq!(result.first_recoverable, None);
+    }
+
+    #[tokio::test]
+    async fn bisect_drives_agent_forward_when_fork_chain_is_short() {
+        // good has 3 steps, bad diverges at step 1 and is also 2 steps.
+        // After substituting good's step 1, the rewritten chain is only 2
+        // steps; the agent must extend it to 3 to satisfy the check.
+        let storage = MemoryStorage::new();
+
+        let good = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "compute then summarize".into(),
+                },
+                msg("assistant", "Let me compute."),
+                msg("assistant", "result: 42"),
+            ],
+        )
+        .await;
+        let bad = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "test".into(),
+                    content: "compute then summarize".into(),
+                },
+                msg("assistant", "I will not compute."),
+            ],
+        )
+        .await;
+
+        // Agent emits "result: 42" once, then stops.
+        let build_agent = |_prefix: &[Step]| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| "result: 42".into())) as Box<dyn Agent>)
+        };
+        let check = |steps: &[Step]| {
+            steps.last().is_some_and(|s| match &s.kind {
+                StepKind::Message { role, content } => {
+                    role == "assistant" && content.contains("42")
+                }
+                _ => false,
+            })
+        };
+
+        let result = bisect_chains(&storage, &good, &bad, build_agent, check)
+            .await
+            .unwrap();
+        assert!(result.first_recoverable.is_some());
+        let trial = &result.trials[result.first_recoverable.unwrap()];
+        assert_eq!(trial.bad_index, 1);
+        assert_eq!(trial.final_text.as_deref(), Some("result: 42"));
     }
 }

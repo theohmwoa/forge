@@ -1,6 +1,6 @@
 # forge
 
-**Git for agent runs.** Content-addressed, branchable, diffable, replayable.
+**Git for agent runs.** Content-addressed, branchable, diffable — including `git bisect`.
 
 > Status: very early. Public design exploration. APIs will break.
 
@@ -8,10 +8,11 @@
 
 Every agent execution is a DAG of content-addressed steps. Each step (prompt, tool call, response, sandbox run) is a hash-keyed node. The graph is the source of truth.
 
-That gives you four things you can't get from append-only logs:
+That gives you five things you can't get from append-only logs:
 
 - **Fork.** Branch any run from any step. Try a different model, a different prompt, a different tool — without re-running the prefix.
 - **Diff.** Compare two runs and see exactly where they diverged. Tool calls, outputs, semantic drift.
+- **Bisect.** `forge bisect <good> <bad>` finds the first step that caused a failure by forking with `good`'s value at each divergent step and asking "did this recover?" Only possible because the graph is content-addressed and forks are free.
 - **Replay.** Re-execute a run deterministically against a different backend. Catch regressions before they ship.
 - **Resume.** Crash mid-run, resume from the last hashed node. No lost work.
 
@@ -74,6 +75,7 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Web UI fork/continue actions (localhost-only until auth ships)
 - [x] Anthropic cache-hit telemetry (`cache_creation_input_tokens` / `cache_read_input_tokens`)
 - [x] `forge-rig` crate to record a [Rig](https://rig.rs) conversation
+- [x] `forge bisect` — git-bisect for agent runs (find the step that caused a failure)
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -133,6 +135,11 @@ forge continue <head> --model claude-sonnet-4-6 --tools calculator
 
 # diff two runs (shared prefix is content-addressed equal, so cheap)
 forge diff <head-a> <head-b>
+
+# git-bisect for agent runs: which step caused the failure?
+# each trial forks `bad` at a divergent step with `good`'s value, drives
+# the agent forward, and checks whether the run recovered.
+forge bisect <good-head> <bad-head> --expect "sum is 5"
 
 # interactive TUI: timeline on the left, content on the right
 forge view <head>
