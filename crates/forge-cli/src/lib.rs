@@ -125,12 +125,25 @@ fn rewrite_kind_text(kind: &StepKind, new_text: &str) -> anyhow::Result<StepKind
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     pub common_prefix_len: usize,
-    pub a_tail: Vec<Step>,
-    pub b_tail: Vec<Step>,
+    pub aligned: Vec<AlignedStep>,
 }
 
-/// Walk two chains pairwise, find the first divergent step. The shared
-/// prefix is content-addressed equal (same hashes), so equality is cheap.
+#[derive(Debug, Clone)]
+pub enum AlignedStep {
+    /// Same hash on both sides (rare in the divergent tail; would be in
+    /// the prefix if the parents lined up too).
+    Match(Step, Step),
+    /// Same structural signature (kind + name/role), different content.
+    Modified(Step, Step),
+    OnlyA(Step),
+    OnlyB(Step),
+}
+
+/// Diff two chains. Phase 1 uses content-addressed equality to find the
+/// shared prefix (cheap). Phase 2 walks the divergent tails and aligns by
+/// step *signature* (kind + name/role) using LCS, then emits per-position
+/// modifications. A step in A and a step in B with the same signature but
+/// different content show up as `Modified`; otherwise as `OnlyA` / `OnlyB`.
 pub fn diff_chains(a: &[Step], b: &[Step]) -> DiffResult {
     let mut common = 0;
     for (sa, sb) in a.iter().zip(b.iter()) {
@@ -140,11 +153,90 @@ pub fn diff_chains(a: &[Step], b: &[Step]) -> DiffResult {
             break;
         }
     }
+    let a_tail = &a[common..];
+    let b_tail = &b[common..];
+
+    let sigs_a: Vec<String> = a_tail.iter().map(|s| signature(&s.kind)).collect();
+    let sigs_b: Vec<String> = b_tail.iter().map(|s| signature(&s.kind)).collect();
+    let pairs = lcs_pairs(&sigs_a, &sigs_b);
+
+    let aligned = pairs
+        .into_iter()
+        .map(|p| match p {
+            (Some(i), Some(j)) => {
+                if a_tail[i].id == b_tail[j].id {
+                    AlignedStep::Match(a_tail[i].clone(), b_tail[j].clone())
+                } else {
+                    AlignedStep::Modified(a_tail[i].clone(), b_tail[j].clone())
+                }
+            }
+            (Some(i), None) => AlignedStep::OnlyA(a_tail[i].clone()),
+            (None, Some(j)) => AlignedStep::OnlyB(b_tail[j].clone()),
+            (None, None) => unreachable!(),
+        })
+        .collect();
+
     DiffResult {
         common_prefix_len: common,
-        a_tail: a[common..].to_vec(),
-        b_tail: b[common..].to_vec(),
+        aligned,
     }
+}
+
+/// Step signature for alignment: collapses content but keeps structural
+/// identity (kind + tool name + message role). Two steps with the same
+/// signature are "the same kind of action," and worth aligning.
+fn signature(kind: &StepKind) -> String {
+    match kind {
+        StepKind::Prompt { .. } => "prompt".into(),
+        StepKind::Message { role, .. } => format!("message:{role}"),
+        StepKind::ToolCall { name, .. } => format!("tool_call:{name}"),
+        StepKind::ToolResult { .. } => "tool_result".into(),
+    }
+}
+
+/// LCS alignment with forward-greedy traceback. The forward direction makes
+/// the algorithm prefer the *earliest* viable match in A when there's a tie —
+/// which matches user intuition: if a chain was forked at step 1, B's single
+/// message should align with A's first message, not the last one of the same
+/// kind. O(N*M) time and space; fine for typical agent chain lengths.
+fn lcs_pairs<T: Eq>(a: &[T], b: &[T]) -> Vec<(Option<usize>, Option<usize>)> {
+    let n = a.len();
+    let m = b.len();
+    // dp[i][j] = LCS length of a[i..] and b[j..]
+    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push((Some(i), Some(j)));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            out.push((Some(i), None));
+            i += 1;
+        } else {
+            out.push((None, Some(j)));
+            j += 1;
+        }
+    }
+    while i < n {
+        out.push((Some(i), None));
+        i += 1;
+    }
+    while j < m {
+        out.push((None, Some(j)));
+        j += 1;
+    }
+    out
 }
 
 pub fn render_diff(diff: &DiffResult) -> String {
@@ -153,22 +245,30 @@ pub fn render_diff(diff: &DiffResult) -> String {
         "shared prefix: {} step(s)\n",
         diff.common_prefix_len
     ));
-    out.push_str("\n--- only in A ---\n");
-    if diff.a_tail.is_empty() {
-        out.push_str("(empty)\n");
-    } else {
-        for s in &diff.a_tail {
-            out.push_str(&format!("{}  {}\n", short(&s.id.0), label(&s.kind)));
-            out.push_str(&format!("        {}\n", brief(&s.kind)));
-        }
+    if diff.aligned.is_empty() {
+        out.push_str("\nno divergence — runs are identical\n");
+        return out;
     }
-    out.push_str("\n--- only in B ---\n");
-    if diff.b_tail.is_empty() {
-        out.push_str("(empty)\n");
-    } else {
-        for s in &diff.b_tail {
-            out.push_str(&format!("{}  {}\n", short(&s.id.0), label(&s.kind)));
-            out.push_str(&format!("        {}\n", brief(&s.kind)));
+    out.push_str("\nlegend: =  same   ~  modified   -  only in A   +  only in B\n\n");
+
+    for entry in &diff.aligned {
+        match entry {
+            AlignedStep::Match(a, _b) => {
+                out.push_str(&format!("=  {}\n", label(&a.kind)));
+            }
+            AlignedStep::Modified(a, b) => {
+                out.push_str(&format!("~  {}\n", label(&a.kind)));
+                out.push_str(&format!("-    {}\n", brief(&a.kind)));
+                out.push_str(&format!("+    {}\n", brief(&b.kind)));
+            }
+            AlignedStep::OnlyA(s) => {
+                out.push_str(&format!("-  {}\n", label(&s.kind)));
+                out.push_str(&format!("-    {}\n", brief(&s.kind)));
+            }
+            AlignedStep::OnlyB(s) => {
+                out.push_str(&format!("+  {}\n", label(&s.kind)));
+                out.push_str(&format!("+    {}\n", brief(&s.kind)));
+            }
         }
     }
     out
@@ -281,7 +381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn diff_finds_first_divergence() {
+    async fn diff_aligns_modified_step_then_extra_a() {
         let storage = MemoryStorage::new();
         let a = build_chain(
             &storage,
@@ -292,26 +392,85 @@ mod tests {
             ],
         )
         .await;
-        // Same prefix, different second step content -> divergence at index 1.
+        // Same prefix, then assistant says something else, B stops there.
         let b_first = a[0].clone();
-        let b_second_kind = msg("assistant", "different reply");
-        let b_second = Step::new(Some(b_first.id.clone()), b_second_kind, 0);
+        let b_second = Step::new(
+            Some(b_first.id.clone()),
+            msg("assistant", "different reply"),
+            0,
+        );
         storage.put(b_second.clone()).await.unwrap();
         let b = vec![b_first, b_second];
 
         let diff = diff_chains(&a, &b);
         assert_eq!(diff.common_prefix_len, 1);
-        assert_eq!(diff.a_tail.len(), 2);
-        assert_eq!(diff.b_tail.len(), 1);
+        // Tail A: [assistant("hello"), user("and now?")]
+        // Tail B: [assistant("different reply")]
+        // Alignment by signature: assistant matches assistant (Modified),
+        // A's user("and now?") has no peer (OnlyA).
+        assert_eq!(diff.aligned.len(), 2);
+        assert!(matches!(diff.aligned[0], AlignedStep::Modified(_, _)));
+        assert!(matches!(diff.aligned[1], AlignedStep::OnlyA(_)));
     }
 
     #[tokio::test]
-    async fn diff_full_match_has_empty_tails() {
+    async fn diff_full_match_has_no_aligned_entries() {
         let storage = MemoryStorage::new();
         let a = build_chain(&storage, vec![msg("user", "hi")]).await;
         let diff = diff_chains(&a, &a);
         assert_eq!(diff.common_prefix_len, 1);
-        assert!(diff.a_tail.is_empty());
-        assert!(diff.b_tail.is_empty());
+        assert!(diff.aligned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn diff_aligns_across_inserted_step() {
+        let storage = MemoryStorage::new();
+        // A: user -> assistant (1 step)
+        // B: user -> assistant (1 step) -> user (extra)
+        // After common prefix of 0, signature LCS pairs assistant<->assistant
+        // and surfaces B's extra user as OnlyB.
+        let a = build_chain(
+            &storage,
+            vec![msg("user", "hi"), msg("assistant", "hi back")],
+        )
+        .await;
+        let b = build_chain(
+            &storage,
+            vec![
+                msg("user", "hi"),
+                msg("assistant", "hi back"),
+                msg("user", "follow up"),
+            ],
+        )
+        .await;
+        let diff = diff_chains(&a, &b);
+        // Both share user("hi") + assistant("hi back") (same hashes)
+        assert_eq!(diff.common_prefix_len, 2);
+        assert_eq!(diff.aligned.len(), 1);
+        assert!(matches!(diff.aligned[0], AlignedStep::OnlyB(_)));
+    }
+
+    #[test]
+    fn lcs_simple() {
+        let a = vec!["a", "b", "c"];
+        let b = vec!["a", "x", "c"];
+        let pairs = lcs_pairs(&a, &b);
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0], (Some(0), Some(0)));
+        assert_eq!(pairs[3], (Some(2), Some(2)));
+    }
+
+    #[test]
+    fn lcs_picks_earliest_match_in_a() {
+        // a has "m" at index 0 and 3; b has "m" once.
+        // Forward greedy traceback should pair b[0] with a[0], not a[3].
+        let a = vec!["m", "t", "r", "m"];
+        let b = vec!["m"];
+        let pairs = lcs_pairs(&a, &b);
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0], (Some(0), Some(0)));
+        assert_eq!(pairs[1], (Some(1), None));
+        assert_eq!(pairs[2], (Some(2), None));
+        assert_eq!(pairs[3], (Some(3), None));
     }
 }

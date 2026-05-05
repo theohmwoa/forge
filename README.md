@@ -46,6 +46,7 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Anthropic tool-use loop (multi-turn, tool calls executed locally)
 - [x] `Tool` trait + built-in `Calculator` tool
 - [x] `forge fork ... --continue` — drive a fresh agent forward from the fork
+- [x] `forge diff` v1: structural alignment via signature-based LCS, modified/only markers
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -98,8 +99,18 @@ new head: cb7329bca5...
 
 $ forge diff 715ac594 cb7329bc
 shared prefix: 1 step(s)
---- only in A ---  (4 steps: original assistant -> tool flow -> answer)
---- only in B ---  (1 step: rewritten assistant)
+
+legend: =  same   ~  modified   -  only in A   +  only in B
+
+~  message[assistant]
+-    I'll use the calculator tool.
++    Let me solve this without tools.
+-  tool_call[calculator]
+-    {"a":2,"b":3,"op":"add"}
+-  tool_result[call-1]
+-    5
+-  message[assistant]
+-    The sum is 5.
 ```
 
 ## License
