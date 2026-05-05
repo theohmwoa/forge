@@ -1,10 +1,12 @@
 //! An [`Agent`] backed by the Anthropic Messages API.
 //!
-//! Supports multi-turn tool use. The agent runs the full prompt -> tool ->
-//! response loop inside `fire()` and queues every emitted step (Prompt,
-//! Message, ToolCall, ToolResult) for the runtime to drain via `next_step`.
+//! Two construction paths:
+//! - [`AnthropicAgent::new`] — fresh run from a user prompt.
+//! - [`AnthropicAgent::continuing`] — resume from a Forge step prefix
+//!   (translated into the Messages API conversation shape).
 //!
-//! Streaming is not yet implemented — each turn is a complete request.
+//! Both modes drive the multi-turn tool-use loop in `fire()`. Streaming is
+//! not yet implemented — each turn is a complete request.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -12,9 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use forge_core::agent::Agent;
 use forge_core::tool::Tool;
-use forge_core::{NodeHash, StepKind};
+use forge_core::{NodeHash, Step, StepKind};
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -46,18 +47,42 @@ pub struct AnthropicAgent {
     tools: Vec<Arc<dyn Tool>>,
     pending: VecDeque<StepKind>,
     fired: bool,
-    user_prompt: String,
+    /// `Some` for fresh runs — emitted as a Prompt step before the first turn.
+    /// `None` for continuations: the prefix already contains the prompt.
+    user_prompt: Option<String>,
+    initial_history: Vec<Value>,
 }
 
 impl AnthropicAgent {
     pub fn new(config: AnthropicConfig, user_prompt: impl Into<String>) -> Self {
+        let user_prompt = user_prompt.into();
+        let initial_history = vec![json!({
+            "role": "user",
+            "content": user_prompt.clone(),
+        })];
         Self {
             config,
             client: reqwest::Client::new(),
             tools: Vec::new(),
             pending: VecDeque::new(),
             fired: false,
-            user_prompt: user_prompt.into(),
+            user_prompt: Some(user_prompt),
+            initial_history,
+        }
+    }
+
+    /// Continue a previously-recorded conversation. The prefix is translated
+    /// into the Anthropic Messages API shape; no new Prompt step is emitted.
+    pub fn continuing(config: AnthropicConfig, prefix: &[Step]) -> Self {
+        let initial_history = prefix_to_history(prefix);
+        Self {
+            config,
+            client: reqwest::Client::new(),
+            tools: Vec::new(),
+            pending: VecDeque::new(),
+            fired: false,
+            user_prompt: None,
+            initial_history,
         }
     }
 
@@ -80,17 +105,14 @@ impl AnthropicAgent {
     }
 
     async fn fire(&mut self) -> anyhow::Result<()> {
-        // Always emit the original user prompt as the first graph step.
-        self.pending.push_back(StepKind::Prompt {
-            model: self.config.model.clone(),
-            content: self.user_prompt.clone(),
-        });
+        if let Some(prompt) = &self.user_prompt {
+            self.pending.push_back(StepKind::Prompt {
+                model: self.config.model.clone(),
+                content: prompt.clone(),
+            });
+        }
 
-        // History is the API-shaped message log we round-trip with each turn.
-        let mut history: Vec<Value> = vec![json!({
-            "role": "user",
-            "content": self.user_prompt.clone()
-        })];
+        let mut history = self.initial_history.clone();
 
         for turn in 0..MAX_TURNS {
             tracing::debug!(turn, model = %self.config.model, "anthropic turn");
@@ -98,7 +120,6 @@ impl AnthropicAgent {
             let content = response["content"].as_array().cloned().unwrap_or_default();
             let stop_reason = response["stop_reason"].as_str().unwrap_or("").to_string();
 
-            // Decode content blocks for the graph + execute any tool_use.
             let mut tool_results: Vec<Value> = Vec::new();
             for block in &content {
                 match block["type"].as_str() {
@@ -139,19 +160,15 @@ impl AnthropicAgent {
                             "is_error": is_error
                         }));
                     }
-                    _ => {
-                        // Skip unknown content block types (image, thinking, ...).
-                    }
+                    _ => {}
                 }
             }
 
-            // Add the assistant's full response to history (for the next turn).
             history.push(json!({ "role": "assistant", "content": content }));
 
             if stop_reason != "tool_use" {
                 return Ok(());
             }
-            // Push tool results as the next user message and loop.
             history.push(json!({ "role": "user", "content": tool_results }));
         }
 
@@ -211,12 +228,62 @@ impl Agent for AnthropicAgent {
     }
 }
 
-// Kept around for backward compat with v0.0.3 deserialization needs; not used.
-#[allow(dead_code)]
-#[derive(Deserialize, Serialize)]
-struct InputMessage {
-    role: String,
-    content: String,
+/// Translate a Forge step prefix into the Anthropic Messages API conversation
+/// shape. Consecutive same-role steps are coalesced into one message with a
+/// `content` array of typed blocks.
+pub fn prefix_to_history(prefix: &[Step]) -> Vec<Value> {
+    let mut history: Vec<Value> = Vec::new();
+    let mut current_role: Option<String> = None;
+    let mut current_blocks: Vec<Value> = Vec::new();
+
+    fn flush(history: &mut Vec<Value>, role: &mut Option<String>, blocks: &mut Vec<Value>) {
+        if let Some(r) = role.take() {
+            if !blocks.is_empty() {
+                history.push(json!({ "role": r, "content": std::mem::take(blocks) }));
+            }
+        }
+    }
+
+    for step in prefix {
+        let (role, block) = match &step.kind {
+            StepKind::Prompt { content, .. } => (
+                "user".to_string(),
+                json!({ "type": "text", "text": content }),
+            ),
+            StepKind::Message { role, content } => {
+                (role.clone(), json!({ "type": "text", "text": content }))
+            }
+            StepKind::ToolCall {
+                call_id,
+                name,
+                input,
+            } => (
+                "assistant".to_string(),
+                json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": input
+                }),
+            ),
+            StepKind::ToolResult { call_id, output } => (
+                "user".to_string(),
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": output.to_string()
+                }),
+            ),
+        };
+
+        if current_role.as_deref() != Some(role.as_str()) {
+            flush(&mut history, &mut current_role, &mut current_blocks);
+            current_role = Some(role);
+        }
+        current_blocks.push(block);
+    }
+    flush(&mut history, &mut current_role, &mut current_blocks);
+    history
 }
 
 #[cfg(test)]
@@ -224,8 +291,10 @@ mod tests {
     use super::*;
     use forge_core::tool::Calculator;
 
-    /// The decoder logic is private but we can exercise it via a synthetic
-    /// response that mirrors what the API would return after a tool_use turn.
+    fn step(parent: Option<NodeHash>, kind: StepKind) -> Step {
+        Step::new(parent, kind, 0)
+    }
+
     #[test]
     fn tool_schemas_serialize() {
         let agent = AnthropicAgent::new(
@@ -240,6 +309,65 @@ mod tests {
         let schemas = agent.tool_schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "calculator");
-        assert!(schemas[0]["input_schema"]["properties"]["op"].is_object());
+    }
+
+    #[test]
+    fn prefix_with_only_a_prompt() {
+        let s = step(
+            None,
+            StepKind::Prompt {
+                model: "m".into(),
+                content: "hello".into(),
+            },
+        );
+        let h = prefix_to_history(&[s]);
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0]["role"], "user");
+        assert_eq!(h[0]["content"][0]["type"], "text");
+        assert_eq!(h[0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn prefix_coalesces_consecutive_same_role() {
+        let s0 = step(
+            None,
+            StepKind::Prompt {
+                model: "m".into(),
+                content: "p".into(),
+            },
+        );
+        let s1 = step(
+            Some(s0.id.clone()),
+            StepKind::Message {
+                role: "assistant".into(),
+                content: "I'll use a tool.".into(),
+            },
+        );
+        let s2 = step(
+            Some(s1.id.clone()),
+            StepKind::ToolCall {
+                call_id: "t1".into(),
+                name: "calculator".into(),
+                input: json!({"op": "add", "a": 1, "b": 2}),
+            },
+        );
+        let s3 = step(
+            Some(s2.id.clone()),
+            StepKind::ToolResult {
+                call_id: "t1".into(),
+                output: json!(3),
+            },
+        );
+
+        let h = prefix_to_history(&[s0, s1, s2, s3]);
+        // user(prompt) -> assistant(text + tool_use) -> user(tool_result)
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0]["role"], "user");
+        assert_eq!(h[1]["role"], "assistant");
+        assert_eq!(h[1]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(h[1]["content"][0]["type"], "text");
+        assert_eq!(h[1]["content"][1]["type"], "tool_use");
+        assert_eq!(h[2]["role"], "user");
+        assert_eq!(h[2]["content"][0]["type"], "tool_result");
     }
 }

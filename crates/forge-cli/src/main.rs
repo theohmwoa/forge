@@ -5,12 +5,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use std::sync::Arc;
 
-use forge::{diff_chains, fork_chain, print_chain, render_diff, run_agent};
+use forge::{diff_chains, fork_chain, print_chain, render_diff, run_agent, run_agent_from};
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
 use forge_core::tool::{Calculator, Tool};
 use forge_core::NodeHash;
-use forge_storage::{RunMeta, SledStorage};
+use forge_storage::{RunMeta, SledStorage, Storage};
 
 #[derive(Parser)]
 #[command(name = "forge", version, about = "Git for agent runs.")]
@@ -51,6 +51,16 @@ enum Cmd {
         /// New text content for the step (Prompt / Message kinds only in v0).
         #[arg(long)]
         rewrite_text: String,
+        /// After rewriting, drive a fresh agent forward from the new step.
+        /// Requires --agent anthropic and ANTHROPIC_API_KEY.
+        #[arg(long, default_value_t = false)]
+        r#continue: bool,
+        #[arg(long, value_enum, default_value_t = AgentKind::Anthropic)]
+        agent: AgentKind,
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
+        #[arg(long, value_enum, value_delimiter = ',')]
+        tools: Vec<ToolKind>,
     },
     /// Diff two recorded runs by walking their chains pairwise.
     Diff { a: String, b: String },
@@ -149,10 +159,40 @@ async fn main() -> anyhow::Result<()> {
             run,
             at,
             rewrite_text,
+            r#continue,
+            agent,
+            model,
+            tools,
         } => {
             let head = resolve_head(&storage, &run)?;
             let chain = storage.chain_to(&head)?;
-            let new_chain = fork_chain(&storage, &chain, &at, &rewrite_text).await?;
+            let mut new_chain = fork_chain(&storage, &chain, &at, &rewrite_text).await?;
+            let fork_point = new_chain.last().cloned().unwrap();
+            let prefix_len = new_chain.len();
+
+            if r#continue {
+                if !matches!(agent, AgentKind::Anthropic) {
+                    anyhow::bail!("--continue only supports --agent anthropic in v0");
+                }
+                let prefix_steps: Vec<forge_core::Step> = {
+                    let mut acc = Vec::with_capacity(new_chain.len());
+                    for h in &new_chain {
+                        let s = storage
+                            .get(h)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("forked step missing: {h}"))?;
+                        acc.push(s);
+                    }
+                    acc
+                };
+                let cfg = AnthropicConfig::from_env(model)?;
+                let mut cont =
+                    AnthropicAgent::continuing(cfg, &prefix_steps).with_tools(build_tools(&tools));
+                let appended =
+                    run_agent_from(Some(fork_point.clone()), &mut cont, &storage).await?;
+                new_chain.extend(appended);
+            }
+
             let new_head = new_chain.last().cloned().unwrap();
             let root = new_chain.first().cloned().unwrap();
             storage.record_run(&RunMeta {
@@ -161,6 +201,9 @@ async fn main() -> anyhow::Result<()> {
                 recorded_at_ms: now_ms(),
             })?;
             println!("forked from {} at step {}", short(&head.0), at);
+            if r#continue {
+                println!("continued: {} new step(s)", new_chain.len() - prefix_len);
+            }
             println!("new head: {new_head}");
             println!("--- dag ---");
             print_chain(&storage, &new_chain).await?;

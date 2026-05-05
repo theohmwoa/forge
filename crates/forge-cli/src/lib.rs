@@ -13,7 +13,20 @@ pub async fn run_agent<A: Agent + ?Sized, S: Storage + ?Sized>(
     agent: &mut A,
     storage: &S,
 ) -> anyhow::Result<Vec<NodeHash>> {
-    let mut parent: Option<NodeHash> = None;
+    run_agent_from(None, agent, storage).await
+}
+
+/// Like [`run_agent`], but the first emitted step's `parent` is the given
+/// `starting_parent`. Used by `forge fork --continue` to thread a continuation
+/// onto the rewritten step.
+///
+/// Only the newly emitted step hashes are returned; the prefix stays implicit.
+pub async fn run_agent_from<A: Agent + ?Sized, S: Storage + ?Sized>(
+    starting_parent: Option<NodeHash>,
+    agent: &mut A,
+    storage: &S,
+) -> anyhow::Result<Vec<NodeHash>> {
+    let mut parent = starting_parent;
     let mut chain = Vec::new();
 
     while let Some(kind) = agent.next_step(parent.clone()).await {

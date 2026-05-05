@@ -45,7 +45,7 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `forge diff` v0: pairwise chain walk, finds first divergence
 - [x] Anthropic tool-use loop (multi-turn, tool calls executed locally)
 - [x] `Tool` trait + built-in `Calculator` tool
-- [ ] `forge fork ... --continue` — drive a fresh agent forward from the fork
+- [x] `forge fork ... --continue` — drive a fresh agent forward from the fork
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -72,6 +72,10 @@ forge replay <head-prefix>
 
 # fork a run at a step, rewriting its content
 forge fork <run-prefix> --at <step-prefix> --rewrite-text "..."
+
+# fork AND continue: rewrite the step, then drive a fresh agent forward
+forge fork <run> --at <step> --rewrite-text "what if I ask differently?" \
+  --continue --tools calculator
 
 # diff two runs (shared prefix is content-addressed equal, so cheap)
 forge diff <head-a> <head-b>
