@@ -45,6 +45,9 @@ enum Cmd {
         /// model via `forge continue`.
         #[arg(long)]
         max_turns: Option<usize>,
+        /// Stream text deltas to stderr as they arrive (Anthropic only).
+        #[arg(long, default_value_t = false)]
+        stream: bool,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay { head: String },
@@ -115,6 +118,7 @@ fn build_fresh_agent(
     model: String,
     tools: Vec<Arc<dyn Tool>>,
     max_turns: Option<usize>,
+    stream: bool,
 ) -> anyhow::Result<Box<dyn Agent>> {
     match kind {
         AgentKind::Fake => Ok(Box::new(FakeAgent::scripted())),
@@ -122,13 +126,18 @@ fn build_fresh_agent(
             let prompt = prompt
                 .ok_or_else(|| anyhow::anyhow!("--prompt is required for --agent anthropic"))?;
             let cfg = AnthropicConfig::from_env(model)?;
-            let mut a = AnthropicAgent::new(cfg, prompt).with_tools(tools);
+            let mut a = AnthropicAgent::new(cfg, prompt)
+                .with_tools(tools)
+                .with_streaming(stream);
             if let Some(n) = max_turns {
                 a = a.with_max_turns(n);
             }
             Ok(Box::new(a))
         }
         AgentKind::Openai => {
+            if stream {
+                tracing::warn!("--stream is not yet implemented for openai; ignoring");
+            }
             let prompt =
                 prompt.ok_or_else(|| anyhow::anyhow!("--prompt is required for --agent openai"))?;
             let cfg = OpenAIConfig::from_env(model)?;
@@ -212,9 +221,10 @@ async fn run() -> anyhow::Result<()> {
             model,
             tools,
             max_turns,
+            stream,
         } => {
             let tool_set = build_tools(&tools);
-            let mut agent = build_fresh_agent(agent, prompt, model, tool_set, max_turns)?;
+            let mut agent = build_fresh_agent(agent, prompt, model, tool_set, max_turns, stream)?;
             let chain = run_agent(agent.as_mut(), &storage).await?;
             if chain.is_empty() {
                 anyhow::bail!("agent emitted no steps; nothing to record");

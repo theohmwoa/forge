@@ -54,6 +54,10 @@ pub struct AnthropicAgent {
     /// Cap on inner-loop turns. Useful for handoffs: run model A for 1 turn,
     /// then model B continues.
     max_turns: usize,
+    /// When true, use the SSE streaming endpoint and print text deltas to
+    /// stderr as they arrive. Steps are still emitted as atomic units when
+    /// each content block completes.
+    stream: bool,
 }
 
 impl AnthropicAgent {
@@ -72,6 +76,7 @@ impl AnthropicAgent {
             user_prompt: Some(user_prompt),
             initial_history,
             max_turns: DEFAULT_MAX_TURNS,
+            stream: false,
         }
     }
 
@@ -88,6 +93,7 @@ impl AnthropicAgent {
             user_prompt: None,
             initial_history,
             max_turns: DEFAULT_MAX_TURNS,
+            stream: false,
         }
     }
 
@@ -101,6 +107,13 @@ impl AnthropicAgent {
     /// CLI to hand off between models mid-run.
     pub fn with_max_turns(mut self, n: usize) -> Self {
         self.max_turns = n.max(1);
+        self
+    }
+
+    /// Enable SSE streaming. Text deltas are printed to stderr in real time
+    /// during a turn; the graph still gets atomic Step entries.
+    pub fn with_streaming(mut self, on: bool) -> Self {
+        self.stream = on;
         self
     }
 
@@ -129,7 +142,11 @@ impl AnthropicAgent {
 
         for turn in 0..self.max_turns {
             tracing::debug!(turn, model = %self.config.model, "anthropic turn");
-            let response = self.call_api(&history).await?;
+            let response = if self.stream {
+                self.call_api_stream(&history).await?
+            } else {
+                self.call_api(&history).await?
+            };
             let content = response["content"].as_array().cloned().unwrap_or_default();
             let stop_reason = response["stop_reason"].as_str().unwrap_or("").to_string();
 
@@ -231,6 +248,108 @@ impl AnthropicAgent {
         }
         Ok(body)
     }
+
+    /// SSE streaming variant of `call_api`. Prints text deltas to stderr as
+    /// they arrive and reconstructs an equivalent of the non-streaming
+    /// response (`{ content, stop_reason }`) for the caller.
+    async fn call_api_stream(&self, history: &[Value]) -> anyhow::Result<Value> {
+        use futures_util::StreamExt;
+        use std::io::Write;
+
+        let mut req = json!({
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "messages": history,
+            "stream": true,
+        });
+        let schemas = self.tool_schemas();
+        if !schemas.is_empty() {
+            req["tools"] = json!(schemas);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-api-key",
+            HeaderValue::from_str(&self.config.api_key)
+                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY contained invalid characters"))?,
+        );
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(ANTHROPIC_VERSION),
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let resp = self
+            .client
+            .post(API_URL)
+            .headers(headers)
+            .json(&req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            anyhow::bail!("anthropic api error ({status}): {body}");
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut partial_json: Vec<String> = Vec::new();
+        let mut stop_reason = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // SSE events are separated by a blank line.
+            while let Some(idx) = buffer.find("\n\n") {
+                let event_block: String = buffer.drain(..idx + 2).collect();
+                let data_payload = event_block
+                    .lines()
+                    .filter(|l| l.starts_with("data:"))
+                    .map(|l| l.trim_start_matches("data:").trim())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if data_payload.is_empty() {
+                    continue;
+                }
+                let event: Value = match serde_json::from_str(&data_payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                handle_anthropic_sse_event(
+                    &event,
+                    &mut blocks,
+                    &mut partial_json,
+                    &mut stop_reason,
+                );
+            }
+        }
+        // Final newline so the next CLI line starts cleanly.
+        let _ = writeln!(std::io::stderr());
+        let _ = std::io::stderr().flush();
+
+        // Finalize any tool_use blocks whose JSON didn't get a content_block_stop
+        // before the connection ended (defensive — Anthropic always sends it).
+        for (i, raw) in partial_json.iter().enumerate() {
+            if i < blocks.len()
+                && blocks[i]["type"] == "tool_use"
+                && blocks[i]["input"].is_object()
+                && blocks[i]["input"].as_object().is_some_and(|o| o.is_empty())
+            {
+                if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+                    blocks[i]["input"] = parsed;
+                }
+            }
+        }
+
+        Ok(json!({
+            "content": blocks,
+            "stop_reason": stop_reason
+        }))
+    }
 }
 
 #[async_trait]
@@ -244,6 +363,72 @@ impl Agent for AnthropicAgent {
             }
         }
         self.pending.pop_front()
+    }
+}
+
+/// Apply one parsed SSE event to the in-progress block buffer.
+fn handle_anthropic_sse_event(
+    event: &Value,
+    blocks: &mut Vec<Value>,
+    partial_json: &mut Vec<String>,
+    stop_reason: &mut String,
+) {
+    use std::io::Write;
+
+    let etype = event["type"].as_str().unwrap_or("");
+    match etype {
+        "content_block_start" => {
+            let idx = event["index"].as_u64().unwrap_or(0) as usize;
+            while blocks.len() <= idx {
+                blocks.push(json!({}));
+                partial_json.push(String::new());
+            }
+            let mut block = event["content_block"].clone();
+            // Initialize accumulators expected by the deltas.
+            if block["type"] == "text" && !block["text"].is_string() {
+                block["text"] = json!("");
+            }
+            if block["type"] == "tool_use" {
+                block["input"] = json!({});
+                partial_json[idx].clear();
+            }
+            blocks[idx] = block;
+        }
+        "content_block_delta" => {
+            let idx = event["index"].as_u64().unwrap_or(0) as usize;
+            if idx >= blocks.len() {
+                return;
+            }
+            let delta = &event["delta"];
+            match delta["type"].as_str() {
+                Some("text_delta") => {
+                    let text = delta["text"].as_str().unwrap_or("");
+                    let existing = blocks[idx]["text"].as_str().unwrap_or("").to_string();
+                    blocks[idx]["text"] = json!(format!("{existing}{text}"));
+                    eprint!("{text}");
+                    let _ = std::io::stderr().flush();
+                }
+                Some("input_json_delta") => {
+                    let partial = delta["partial_json"].as_str().unwrap_or("");
+                    partial_json[idx].push_str(partial);
+                }
+                _ => {}
+            }
+        }
+        "content_block_stop" => {
+            let idx = event["index"].as_u64().unwrap_or(0) as usize;
+            if idx < blocks.len() && blocks[idx]["type"] == "tool_use" {
+                if let Ok(parsed) = serde_json::from_str::<Value>(&partial_json[idx]) {
+                    blocks[idx]["input"] = parsed;
+                }
+            }
+        }
+        "message_delta" => {
+            if let Some(sr) = event["delta"]["stop_reason"].as_str() {
+                *stop_reason = sr.to_string();
+            }
+        }
+        _ => {}
     }
 }
 

@@ -10,6 +10,7 @@ description = "Forge agent adapter for the Anthropic Messages API."
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 forge-core = { path = "../forge-core" }
+futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
