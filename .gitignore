@@ -5,3 +5,5 @@
 .env
 .vscode/
 .idea/
+forge.db/
+*.db/
