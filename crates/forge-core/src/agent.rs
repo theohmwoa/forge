@@ -32,6 +32,10 @@ impl FakeAgent {
             model: "fake-model-v1".into(),
             content: "Sum two numbers, 2 and 3.".into(),
         });
+        remaining.push_back(StepKind::Message {
+            role: "assistant".into(),
+            content: "I'll use the calculator tool.".into(),
+        });
         remaining.push_back(StepKind::ToolCall {
             call_id: "call-1".into(),
             name: "calculator".into(),
@@ -40,6 +44,10 @@ impl FakeAgent {
         remaining.push_back(StepKind::ToolResult {
             call_id: "call-1".into(),
             output: json!(5),
+        });
+        remaining.push_back(StepKind::Message {
+            role: "assistant".into(),
+            content: "The sum is 5.".into(),
         });
         Self { remaining }
     }
@@ -81,12 +89,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn fake_agent_emits_three_steps() {
+    async fn fake_agent_emits_a_well_formed_conversation() {
         let mut agent = FakeAgent::scripted();
-        let mut count = 0;
-        while agent.next_step(None).await.is_some() {
-            count += 1;
+        let mut steps = Vec::new();
+        while let Some(s) = agent.next_step(None).await {
+            steps.push(s);
         }
-        assert_eq!(count, 3);
+        assert!(steps.len() >= 3, "should emit a multi-step conversation");
+        assert!(matches!(steps.first(), Some(StepKind::Prompt { .. })));
+        assert!(steps.iter().any(|s| matches!(s, StepKind::ToolCall { .. })));
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, StepKind::ToolResult { .. })));
     }
 }

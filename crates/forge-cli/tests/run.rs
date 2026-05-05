@@ -3,11 +3,11 @@ use forge_core::agent::FakeAgent;
 use forge_storage::{MemoryStorage, Storage};
 
 #[tokio::test]
-async fn fake_agent_writes_a_three_step_chain() {
+async fn fake_agent_writes_a_linked_chain() {
     let storage = MemoryStorage::new();
     let mut agent = FakeAgent::scripted();
     let chain = run_agent(&mut agent, &storage).await.expect("run ok");
-    assert_eq!(chain.len(), 3);
+    assert!(chain.len() >= 3, "expected a multi-step conversation");
 
     // First step is root.
     let root = storage.get(&chain[0]).await.unwrap().unwrap();

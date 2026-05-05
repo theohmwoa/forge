@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use forge::{print_chain, run_agent};
+use forge::{diff_chains, fork_chain, print_chain, render_diff, run_agent};
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
 use forge_core::NodeHash;
@@ -24,32 +24,29 @@ struct Cli {
 enum Cmd {
     /// Run an agent and record every step into the graph.
     Run {
-        /// Which agent to drive.
         #[arg(long, value_enum, default_value_t = AgentKind::Fake)]
         agent: AgentKind,
-
-        /// Prompt to send the agent. Required for non-fake agents.
         #[arg(long)]
         prompt: Option<String>,
-
-        /// Model name (used by `anthropic`).
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
     },
     /// Walk a recorded run from its head and print the chain.
-    Replay {
-        /// Run head hash (or any prefix that uniquely identifies one).
-        head: String,
-    },
+    Replay { head: String },
     /// List recorded runs.
     Runs,
-    /// Fork an existing run from a specific step.
+    /// Fork a recorded run at a specific step, rewriting its text content.
     Fork {
+        /// Run head hash (or unique prefix).
         run: String,
+        /// Step in the chain to rewrite (hash or unique prefix).
         #[arg(long)]
         at: String,
+        /// New text content for the step (Prompt / Message kinds only in v0).
+        #[arg(long)]
+        rewrite_text: String,
     },
-    /// Diff two runs and surface where they diverged.
+    /// Diff two recorded runs by walking their chains pairwise.
     Diff { a: String, b: String },
 }
 
@@ -125,17 +122,40 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Cmd::Fork { run, at } => {
-            tracing::info!(?run, ?at, "fork: not yet implemented");
+        Cmd::Fork {
+            run,
+            at,
+            rewrite_text,
+        } => {
+            let head = resolve_head(&storage, &run)?;
+            let chain = storage.chain_to(&head)?;
+            let new_chain = fork_chain(&storage, &chain, &at, &rewrite_text).await?;
+            let new_head = new_chain.last().cloned().unwrap();
+            let root = new_chain.first().cloned().unwrap();
+            storage.record_run(&RunMeta {
+                head: new_head.clone(),
+                root,
+                recorded_at_ms: now_ms(),
+            })?;
+            println!("forked from {} at step {}", short(&head.0), at);
+            println!("new head: {new_head}");
+            println!("--- dag ---");
+            print_chain(&storage, &new_chain).await?;
         }
         Cmd::Diff { a, b } => {
-            tracing::info!(?a, ?b, "diff: not yet implemented");
+            let head_a = resolve_head(&storage, &a)?;
+            let head_b = resolve_head(&storage, &b)?;
+            let chain_a = storage.chain_to(&head_a)?;
+            let chain_b = storage.chain_to(&head_b)?;
+            let result = diff_chains(&chain_a, &chain_b);
+            println!("A: {}  ({} steps)", short(&head_a.0), chain_a.len());
+            println!("B: {}  ({} steps)", short(&head_b.0), chain_b.len());
+            print!("{}", render_diff(&result));
         }
     }
     Ok(())
 }
 
-/// Resolve a user-provided head ref: either a full hash or a unique prefix.
 fn resolve_head(storage: &SledStorage, query: &str) -> anyhow::Result<NodeHash> {
     let runs = storage.list_runs()?;
     let matches: Vec<_> = runs

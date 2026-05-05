@@ -41,13 +41,14 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] sled backend; `forge runs` and `forge replay` read from disk
 - [x] Anthropic Messages API adapter (single-shot, no tools yet)
 - [x] `Matcher` trait sketch (interception / tripwires)
+- [x] `forge fork <run> --at <step> --rewrite-text` (Prompt/Message kinds)
+- [x] `forge diff` v0: pairwise chain walk, finds first divergence
 - [ ] Anthropic tool-use loop (multi-turn, tool calls round-tripped)
-- [ ] `forge fork <run>@<step>` — load state, swap one variable, drive forward
-- [ ] `forge diff` v0: structural alignment of tool calls
-- [ ] Tripwires v0: regex / JSON-path matchers, abort + auto-fork on hit
+- [ ] `forge fork ... --continue` — drive a fresh agent forward from the fork
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
+- [ ] Tripwires v0 (only useful once a real agent loop is intercepting; deferred)
 - [ ] Deterministic replay (seeded where APIs allow, full request/response capture)
 - [ ] Postgres backend (durable resume across machines, large blob dedup)
 - [ ] TUI viewer (`ratatui`)
@@ -55,15 +56,45 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 ## Quick start
 
 ```bash
-# scripted demo agent (no API key required)
-cargo run -- run --agent fake
+# record a 5-step scripted run (no API key required)
+forge run --agent fake
 
-# real Anthropic call
+# real Anthropic call (single-shot, no tools yet)
 export ANTHROPIC_API_KEY=...
-cargo run -- run --agent anthropic --prompt "what is 2 + 2"
+forge run --agent anthropic --prompt "what is 2 + 2"
 
-cargo run -- runs                   # list recorded runs
-cargo run -- replay <prefix>        # walk the chain back from disk
+# list recorded runs
+forge runs
+
+# walk a run back from disk
+forge replay <head-prefix>
+
+# fork a run at a step, rewriting its content
+forge fork <run-prefix> --at <step-prefix> --rewrite-text "..."
+
+# diff two runs (shared prefix is content-addressed equal, so cheap)
+forge diff <head-a> <head-b>
+```
+
+End-to-end example (FakeAgent emits a 5-step conversation; we fork at the
+assistant's first message and diff):
+
+```
+$ forge run --agent fake
+run complete: 5 steps
+  0  6952335a6f  prompt[fake-model-v1]
+  1  fadbc99433  message[assistant]   "I'll use the calculator tool."
+  2  ff2e474b78  tool_call[calculator]
+  3  2cec969b11  tool_result[call-1]
+  4  715ac59405  message[assistant]   "The sum is 5."
+
+$ forge fork 715ac594 --at fadbc994 --rewrite-text "Let me solve this without tools."
+new head: cb7329bca5...
+
+$ forge diff 715ac594 cb7329bc
+shared prefix: 1 step(s)
+--- only in A ---  (4 steps: original assistant -> tool flow -> answer)
+--- only in B ---  (1 step: rewritten assistant)
 ```
 
 ## License
