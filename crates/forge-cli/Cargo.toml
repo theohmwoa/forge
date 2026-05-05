@@ -19,6 +19,7 @@ clap = { workspace = true }
 forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }
 forge-storage = { path = "../forge-storage" }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

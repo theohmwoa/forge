@@ -307,6 +307,7 @@ dependencies = [
  "forge-anthropic",
  "forge-core",
  "forge-storage",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

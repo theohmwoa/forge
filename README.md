@@ -47,6 +47,9 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `Tool` trait + built-in `Calculator` tool
 - [x] `forge fork ... --continue` — drive a fresh agent forward from the fork
 - [x] `forge diff` v1: structural alignment via signature-based LCS, modified/only markers
+- [x] Fork supports every step kind (text for prompt/message, JSON for tool_call/tool_result)
+- [x] Auto-execute tool after fork-on-tool-call when `--continue` is set
+- [x] `forge continue <run>` + `--max-turns` on run/continue/fork — mid-run model handoffs
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -71,12 +74,19 @@ forge runs
 # walk a run back from disk
 forge replay <head-prefix>
 
-# fork a run at a step, rewriting its content
-forge fork <run-prefix> --at <step-prefix> --rewrite-text "..."
+# fork at any step. Text for prompt/message, JSON for tool_call/tool_result.
+forge fork <run> --at <prompt-prefix>     --rewrite "ask differently"
+forge fork <run> --at <tool-call-prefix>  --rewrite '{"op":"mul","a":7,"b":8}'
+forge fork <run> --at <tool-result-prefix> --rewrite '99'
 
-# fork AND continue: rewrite the step, then drive a fresh agent forward
-forge fork <run> --at <step> --rewrite-text "what if I ask differently?" \
-  --continue --tools calculator
+# fork + continue: drive a fresh agent forward from the new step.
+# For tool_call rewrites, the tool runs locally first to produce a real result.
+forge fork <run> --at <step> --rewrite "..." --continue --tools calculator
+
+# stop a run early so another model can pick up
+forge run --agent anthropic --model claude-haiku-4-5-20251001 --max-turns 1 \
+    --prompt "what is 47 * 53?" --tools calculator
+forge continue <head> --model claude-sonnet-4-6 --tools calculator
 
 # diff two runs (shared prefix is content-addressed equal, so cheap)
 forge diff <head-a> <head-b>

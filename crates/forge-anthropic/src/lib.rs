@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const MAX_TURNS: usize = 16;
+const DEFAULT_MAX_TURNS: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -51,6 +51,9 @@ pub struct AnthropicAgent {
     /// `None` for continuations: the prefix already contains the prompt.
     user_prompt: Option<String>,
     initial_history: Vec<Value>,
+    /// Cap on inner-loop turns. Useful for handoffs: run model A for 1 turn,
+    /// then model B continues.
+    max_turns: usize,
 }
 
 impl AnthropicAgent {
@@ -68,6 +71,7 @@ impl AnthropicAgent {
             fired: false,
             user_prompt: Some(user_prompt),
             initial_history,
+            max_turns: DEFAULT_MAX_TURNS,
         }
     }
 
@@ -83,11 +87,20 @@ impl AnthropicAgent {
             fired: false,
             user_prompt: None,
             initial_history,
+            max_turns: DEFAULT_MAX_TURNS,
         }
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// Cap the number of API turns this agent will run. After the cap, the
+    /// agent stops cleanly even if `stop_reason == "tool_use"`. Used by the
+    /// CLI to hand off between models mid-run.
+    pub fn with_max_turns(mut self, n: usize) -> Self {
+        self.max_turns = n.max(1);
         self
     }
 
@@ -114,7 +127,7 @@ impl AnthropicAgent {
 
         let mut history = self.initial_history.clone();
 
-        for turn in 0..MAX_TURNS {
+        for turn in 0..self.max_turns {
             tracing::debug!(turn, model = %self.config.model, "anthropic turn");
             let response = self.call_api(&history).await?;
             let content = response["content"].as_array().cloned().unwrap_or_default();
@@ -172,7 +185,13 @@ impl AnthropicAgent {
             history.push(json!({ "role": "user", "content": tool_results }));
         }
 
-        anyhow::bail!("exceeded MAX_TURNS={MAX_TURNS}; aborting agent");
+        // Reached the cap; not an error — the runtime may want to swap models
+        // and call `continuing` to keep going.
+        tracing::info!(
+            max_turns = self.max_turns,
+            "anthropic agent stopped at turn cap"
+        );
+        Ok(())
     }
 
     async fn call_api(&self, history: &[Value]) -> anyhow::Result<Value> {

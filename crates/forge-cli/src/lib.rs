@@ -64,18 +64,21 @@ pub async fn print_chain<S: Storage + ?Sized>(
     Ok(())
 }
 
-/// Fork a chain at the step matching `at_prefix`, replacing its text content
-/// with `rewrite_text`. The new chain shares the prefix up to (but not
-/// including) the rewritten step; everything after is dropped — the user
-/// drives a fresh agent forward later.
+/// Fork a chain at the step matching `at_prefix`, replacing its content with
+/// `rewrite`. The new chain shares the prefix up to (but not including) the
+/// rewritten step; everything after is dropped.
 ///
-/// Only `Prompt` and `Message` step kinds are rewritable in v0; tool-call
-/// rewriting needs the tool-use loop to land first.
+/// Interpretation of `rewrite` depends on the target step's kind:
+/// - `Prompt` / `Message`: raw text replaces the content field.
+/// - `ToolCall`: parsed as JSON, replaces the `input` field. The tool name
+///   and `call_id` are preserved.
+/// - `ToolResult`: parsed as JSON, replaces the `output` field. The
+///   `call_id` is preserved.
 pub async fn fork_chain<S: Storage + ?Sized>(
     storage: &S,
     chain: &[Step],
     at_prefix: &str,
-    rewrite_text: &str,
+    rewrite: &str,
 ) -> anyhow::Result<Vec<NodeHash>> {
     let matches: Vec<usize> = chain
         .iter()
@@ -97,7 +100,7 @@ pub async fn fork_chain<S: Storage + ?Sized>(
     } else {
         Some(chain[pos - 1].id.clone())
     };
-    let new_kind = rewrite_kind_text(&chain[pos].kind, rewrite_text)?;
+    let new_kind = rewrite_kind(&chain[pos].kind, rewrite)?;
     let new_step = Step::new(parent, new_kind, now_ms());
     let new_id = storage.put(new_step.clone()).await?;
 
@@ -106,20 +109,82 @@ pub async fn fork_chain<S: Storage + ?Sized>(
     Ok(new_chain)
 }
 
-fn rewrite_kind_text(kind: &StepKind, new_text: &str) -> anyhow::Result<StepKind> {
+fn rewrite_kind(kind: &StepKind, raw: &str) -> anyhow::Result<StepKind> {
     match kind {
         StepKind::Prompt { model, .. } => Ok(StepKind::Prompt {
             model: model.clone(),
-            content: new_text.into(),
+            content: raw.into(),
         }),
         StepKind::Message { role, .. } => Ok(StepKind::Message {
             role: role.clone(),
-            content: new_text.into(),
+            content: raw.into(),
         }),
-        StepKind::ToolCall { .. } | StepKind::ToolResult { .. } => {
-            anyhow::bail!("--rewrite-text only supports prompt or message steps in v0")
+        StepKind::ToolCall { call_id, name, .. } => {
+            let input: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+                anyhow::anyhow!("--rewrite must be valid JSON for tool_call steps: {e}")
+            })?;
+            Ok(StepKind::ToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input,
+            })
+        }
+        StepKind::ToolResult { call_id, .. } => {
+            let output: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
+                anyhow::anyhow!("--rewrite must be valid JSON for tool_result steps: {e}")
+            })?;
+            Ok(StepKind::ToolResult {
+                call_id: call_id.clone(),
+                output,
+            })
         }
     }
+}
+
+/// After a fork, append a tool execution if the rewritten step was a
+/// `ToolCall`. Looks up `name` in `tools`, runs it with the new input, and
+/// returns the new `ToolResult` step's hash. No-op for non-tool-call kinds.
+///
+/// Returns `Ok(None)` when the last step in `chain` isn't a `ToolCall`.
+pub async fn auto_run_tool_after_fork<S: Storage + ?Sized>(
+    storage: &S,
+    chain: &mut Vec<NodeHash>,
+    tools: &[std::sync::Arc<dyn forge_core::tool::Tool>],
+) -> anyhow::Result<Option<NodeHash>> {
+    let last_hash = chain
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("chain is empty; nothing to extend"))?;
+    let last_step = storage
+        .get(&last_hash)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("step missing: {last_hash}"))?;
+
+    let (call_id, name, input) = match &last_step.kind {
+        StepKind::ToolCall {
+            call_id,
+            name,
+            input,
+        } => (call_id.clone(), name.clone(), input.clone()),
+        _ => return Ok(None),
+    };
+
+    let tool = tools
+        .iter()
+        .find(|t| t.name() == name)
+        .ok_or_else(|| anyhow::anyhow!("tool {name:?} not registered; pass --tools {name}"))?;
+    let output = match tool.run(&input).await {
+        Ok(v) => v,
+        Err(e) => serde_json::json!(e.to_string()),
+    };
+    let result_step = Step::new(
+        Some(last_hash),
+        StepKind::ToolResult { call_id, output },
+        now_ms(),
+    );
+    let result_id = storage.put(result_step).await?;
+    chain.push(result_id.clone());
+    Ok(Some(result_id))
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +443,95 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no step"));
+    }
+
+    #[tokio::test]
+    async fn fork_rewrites_tool_call_input_as_json() {
+        let storage = MemoryStorage::new();
+        let chain = build_chain(
+            &storage,
+            vec![
+                msg("user", "do math"),
+                StepKind::ToolCall {
+                    call_id: "t1".into(),
+                    name: "calculator".into(),
+                    input: serde_json::json!({"op":"add","a":1,"b":2}),
+                },
+            ],
+        )
+        .await;
+        let at: String = chain[1].id.0.chars().take(8).collect();
+        let new_chain = fork_chain(&storage, &chain, &at, r#"{"op":"mul","a":7,"b":8}"#)
+            .await
+            .unwrap();
+        let new_step = storage.get(&new_chain[1]).await.unwrap().unwrap();
+        match new_step.kind {
+            StepKind::ToolCall { name, input, .. } => {
+                assert_eq!(name, "calculator");
+                assert_eq!(input["op"], "mul");
+                assert_eq!(input["a"], 7);
+            }
+            _ => panic!("expected ToolCall after rewrite"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_invalid_json_for_tool_steps() {
+        let storage = MemoryStorage::new();
+        let chain = build_chain(
+            &storage,
+            vec![StepKind::ToolResult {
+                call_id: "t1".into(),
+                output: serde_json::json!(5),
+            }],
+        )
+        .await;
+        let at: String = chain[0].id.0.chars().take(8).collect();
+        let err = fork_chain(&storage, &chain, &at, "not json at all")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("valid JSON"));
+    }
+
+    #[tokio::test]
+    async fn auto_run_tool_extends_chain_with_fresh_result() {
+        use forge_core::tool::Calculator;
+        let storage = MemoryStorage::new();
+        let chain = build_chain(
+            &storage,
+            vec![StepKind::ToolCall {
+                call_id: "t1".into(),
+                name: "calculator".into(),
+                input: serde_json::json!({"op":"mul","a":7,"b":8}),
+            }],
+        )
+        .await;
+        let mut hashes: Vec<NodeHash> = chain.iter().map(|s| s.id.clone()).collect();
+        let tools: Vec<std::sync::Arc<dyn forge_core::tool::Tool>> =
+            vec![std::sync::Arc::new(Calculator)];
+        let appended = auto_run_tool_after_fork(&storage, &mut hashes, &tools)
+            .await
+            .unwrap();
+        assert!(appended.is_some());
+        assert_eq!(hashes.len(), 2);
+        let result = storage.get(hashes.last().unwrap()).await.unwrap().unwrap();
+        match result.kind {
+            StepKind::ToolResult { output, .. } => assert_eq!(output, serde_json::json!(56.0)),
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_run_tool_is_noop_for_non_tool_call_tail() {
+        let storage = MemoryStorage::new();
+        let chain = build_chain(&storage, vec![msg("user", "hi")]).await;
+        let mut hashes: Vec<NodeHash> = chain.iter().map(|s| s.id.clone()).collect();
+        let tools: Vec<std::sync::Arc<dyn forge_core::tool::Tool>> = vec![];
+        let appended = auto_run_tool_after_fork(&storage, &mut hashes, &tools)
+            .await
+            .unwrap();
+        assert!(appended.is_none());
+        assert_eq!(hashes.len(), 1);
     }
 
     #[tokio::test]
