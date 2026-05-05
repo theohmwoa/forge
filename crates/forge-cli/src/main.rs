@@ -103,6 +103,15 @@ enum Cmd {
         #[arg(long)]
         diff: Option<String>,
     },
+    /// Run an HTTP recorder proxy. Point your existing agent at this proxy's
+    /// URL (e.g. ANTHROPIC_BASE_URL or OPENAI_BASE_URL) and every API call
+    /// gets recorded as a Forge run.
+    Serve {
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -391,6 +400,31 @@ async fn run() -> anyhow::Result<()> {
                 tui::view_diff(chain_a, chain_b, short(&head_a.0), short(&head_b.0))?;
             }
         },
+        Cmd::Serve { port, host } => {
+            // Drop our handle so the server can re-open the same db.
+            drop(storage);
+            let storage = Arc::new(SledStorage::open(&cli.db)?);
+            let state = Arc::new(forge_recorder::RecorderState {
+                storage,
+                client: reqwest::Client::new(),
+            });
+            let app = forge_recorder::router(state);
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            println!("forge serve listening on http://{addr}");
+            println!();
+            println!("for an Anthropic client:");
+            println!("  export ANTHROPIC_BASE_URL=http://{addr}");
+            println!(
+                "  # then call your existing agent normally — every /v1/messages call is recorded"
+            );
+            println!();
+            println!("for an OpenAI client:");
+            println!("  export OPENAI_BASE_URL=http://{addr}/v1");
+            println!();
+            println!("press ctrl-c to stop");
+            axum::serve(listener, app).await?;
+        }
     }
     Ok(())
 }

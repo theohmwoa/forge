@@ -319,12 +319,15 @@ impl AnthropicAgent {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                handle_anthropic_sse_event(
+                if let Some(delta) = handle_anthropic_sse_event(
                     &event,
                     &mut blocks,
                     &mut partial_json,
                     &mut stop_reason,
-                );
+                ) {
+                    eprint!("{delta}");
+                    let _ = std::io::stderr().flush();
+                }
             }
         }
         // Final newline so the next CLI line starts cleanly.
@@ -366,15 +369,44 @@ impl Agent for AnthropicAgent {
     }
 }
 
+/// Parse a complete Anthropic SSE response body (concatenated event stream)
+/// into the same `{ content, stop_reason }` shape as a non-streaming response.
+/// Useful for the recorder, which tees the upstream SSE stream to its client
+/// and then has the full body to convert into Forge steps.
+pub fn parse_anthropic_sse_body(body: &str) -> serde_json::Value {
+    let mut blocks: Vec<Value> = Vec::new();
+    let mut partial_json: Vec<String> = Vec::new();
+    let mut stop_reason = String::new();
+
+    for chunk in body.split("\n\n") {
+        let data: String = chunk
+            .lines()
+            .filter(|l| l.starts_with("data:"))
+            .map(|l| l.trim_start_matches("data:").trim())
+            .collect::<Vec<_>>()
+            .join("");
+        if data.is_empty() {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        handle_anthropic_sse_event(&event, &mut blocks, &mut partial_json, &mut stop_reason);
+    }
+    json!({ "content": blocks, "stop_reason": stop_reason })
+}
+
 /// Apply one parsed SSE event to the in-progress block buffer.
+/// Returns the text delta string when the event is a `text_delta`, so callers
+/// that want to stream output (e.g. the agent printing to stderr) can do so;
+/// callers that don't (e.g. the recorder) just ignore the return value.
 fn handle_anthropic_sse_event(
     event: &Value,
     blocks: &mut Vec<Value>,
     partial_json: &mut Vec<String>,
     stop_reason: &mut String,
-) {
-    use std::io::Write;
-
+) -> Option<String> {
     let etype = event["type"].as_str().unwrap_or("");
     match etype {
         "content_block_start" => {
@@ -384,7 +416,6 @@ fn handle_anthropic_sse_event(
                 partial_json.push(String::new());
             }
             let mut block = event["content_block"].clone();
-            // Initialize accumulators expected by the deltas.
             if block["type"] == "text" && !block["text"].is_string() {
                 block["text"] = json!("");
             }
@@ -393,26 +424,27 @@ fn handle_anthropic_sse_event(
                 partial_json[idx].clear();
             }
             blocks[idx] = block;
+            None
         }
         "content_block_delta" => {
             let idx = event["index"].as_u64().unwrap_or(0) as usize;
             if idx >= blocks.len() {
-                return;
+                return None;
             }
             let delta = &event["delta"];
             match delta["type"].as_str() {
                 Some("text_delta") => {
-                    let text = delta["text"].as_str().unwrap_or("");
+                    let text = delta["text"].as_str().unwrap_or("").to_string();
                     let existing = blocks[idx]["text"].as_str().unwrap_or("").to_string();
                     blocks[idx]["text"] = json!(format!("{existing}{text}"));
-                    eprint!("{text}");
-                    let _ = std::io::stderr().flush();
+                    Some(text)
                 }
                 Some("input_json_delta") => {
                     let partial = delta["partial_json"].as_str().unwrap_or("");
                     partial_json[idx].push_str(partial);
+                    None
                 }
-                _ => {}
+                _ => None,
             }
         }
         "content_block_stop" => {
@@ -422,13 +454,15 @@ fn handle_anthropic_sse_event(
                     blocks[idx]["input"] = parsed;
                 }
             }
+            None
         }
         "message_delta" => {
             if let Some(sr) = event["delta"]["stop_reason"].as_str() {
                 *stop_reason = sr.to_string();
             }
+            None
         }
-        _ => {}
+        _ => None,
     }
 }
 
