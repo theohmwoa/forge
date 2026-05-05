@@ -16,6 +16,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }
 forge-storage = { path = "../forge-storage" }
 tokio = { workspace = true }

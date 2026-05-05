@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use forge::{print_chain, run_agent};
-use forge_core::agent::FakeAgent;
+use forge_anthropic::{AnthropicAgent, AnthropicConfig};
+use forge_core::agent::{Agent, FakeAgent};
 use forge_core::NodeHash;
 use forge_storage::{RunMeta, SledStorage};
 
@@ -23,8 +24,17 @@ struct Cli {
 enum Cmd {
     /// Run an agent and record every step into the graph.
     Run {
-        /// Path to a run spec. Ignored in v0.0.2; uses FakeAgent.
-        spec: Option<String>,
+        /// Which agent to drive.
+        #[arg(long, value_enum, default_value_t = AgentKind::Fake)]
+        agent: AgentKind,
+
+        /// Prompt to send the agent. Required for non-fake agents.
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Model name (used by `anthropic`).
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        model: String,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay {
@@ -43,6 +53,12 @@ enum Cmd {
     Diff { a: String, b: String },
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum AgentKind {
+    Fake,
+    Anthropic,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -53,16 +69,26 @@ async fn main() -> anyhow::Result<()> {
     let storage = SledStorage::open(&cli.db)?;
 
     match cli.cmd {
-        Cmd::Run { spec } => {
-            if let Some(spec) = spec {
-                tracing::warn!(?spec, "spec parsing not yet implemented; using FakeAgent");
+        Cmd::Run {
+            agent,
+            prompt,
+            model,
+        } => {
+            let mut agent: Box<dyn Agent> = match agent {
+                AgentKind::Fake => Box::new(FakeAgent::scripted()),
+                AgentKind::Anthropic => {
+                    let prompt = prompt.ok_or_else(|| {
+                        anyhow::anyhow!("--prompt is required for --agent anthropic")
+                    })?;
+                    let cfg = AnthropicConfig::from_env(model)?;
+                    Box::new(AnthropicAgent::new(cfg, prompt))
+                }
+            };
+            let chain = run_agent(agent.as_mut(), &storage).await?;
+            if chain.is_empty() {
+                anyhow::bail!("agent emitted no steps; nothing to record");
             }
-            let mut agent = FakeAgent::scripted();
-            let chain = run_agent(&mut agent, &storage).await?;
-            let head = chain
-                .last()
-                .cloned()
-                .expect("agent emitted at least one step");
+            let head = chain.last().cloned().unwrap();
             let root = chain.first().cloned().unwrap();
             storage.record_run(&RunMeta {
                 head: head.clone(),

@@ -27,9 +27,10 @@ Cargo workspace, three crates:
 
 | crate | what it owns |
 |---|---|
-| `forge-core` | step types, hashes, graph invariants |
+| `forge-core` | step types, hashes, graph invariants, `Agent` and `Matcher` traits |
 | `forge-storage` | `Storage` trait + in-memory / sled / Postgres backends |
-| `forge-cli` | the `forge` binary (`run`, `fork`, `diff`, `replay`) |
+| `forge-anthropic` | Anthropic Messages API adapter (single-shot for now) |
+| `forge-cli` | the `forge` binary (`run`, `replay`, `runs`, `fork`, `diff`) |
 
 Storage backends planned: in-memory (done), sled, Postgres (single source of truth, durable resume).
 
@@ -38,10 +39,14 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Workspace skeleton, core types, in-memory storage
 - [x] `forge run` against a stub agent harness (FakeAgent)
 - [x] sled backend; `forge runs` and `forge replay` read from disk
-- [ ] Adapter for [Rig](https://rig.rs/) — real LLM agents
-- [ ] HTTP recorder middleware (drop-in for any agent)
+- [x] Anthropic Messages API adapter (single-shot, no tools yet)
+- [x] `Matcher` trait sketch (interception / tripwires)
+- [ ] Anthropic tool-use loop (multi-turn, tool calls round-tripped)
 - [ ] `forge fork <run>@<step>` — load state, swap one variable, drive forward
 - [ ] `forge diff` v0: structural alignment of tool calls
+- [ ] Tripwires v0: regex / JSON-path matchers, abort + auto-fork on hit
+- [ ] HTTP recorder middleware (drop-in for any agent)
+- [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
 - [ ] Deterministic replay (seeded where APIs allow, full request/response capture)
 - [ ] Postgres backend (durable resume across machines, large blob dedup)
@@ -50,7 +55,13 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 ## Quick start
 
 ```bash
-cargo run -- run                    # record a fake run to ./forge.db
+# scripted demo agent (no API key required)
+cargo run -- run --agent fake
+
+# real Anthropic call
+export ANTHROPIC_API_KEY=...
+cargo run -- run --agent anthropic --prompt "what is 2 + 2"
+
 cargo run -- runs                   # list recorded runs
 cargo run -- replay <prefix>        # walk the chain back from disk
 ```

@@ -52,6 +52,30 @@ impl Agent for FakeAgent {
     }
 }
 
+/// A matcher inspects an in-flight step before it is committed to the graph.
+/// Returning a non-`Continue` decision lets the runtime fork: persist the
+/// original under a `would_have_been` edge, then apply the decision.
+///
+/// Concrete matchers (regex, JSON-path, semantic, LLM-judge) live in their
+/// own crates. This trait is intentionally minimal so it can sit upstream
+/// of any of them.
+#[async_trait]
+pub trait Matcher: Send + Sync {
+    async fn inspect(&self, step: &StepKind) -> MatcherDecision;
+}
+
+#[derive(Debug, Clone)]
+pub enum MatcherDecision {
+    /// Pass through unchanged.
+    Continue,
+    /// Replace this step's content with a rewritten variant.
+    Rewrite(StepKind),
+    /// Abort this step; the runtime should not commit it.
+    Abort { reason: String },
+    /// Pause the run and surface a handle for human review (Mirage-style).
+    Pause { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
