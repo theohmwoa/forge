@@ -55,6 +55,12 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Cross-provider continuations: run with Claude, continue with GPT-5
 - [x] Friendly error rendering (no Rust backtrace on missing API key)
 - [x] `forge view` TUI: timeline + content panes, single-run and aligned-diff modes
+- [x] Anthropic SSE streaming with text deltas to stderr
+- [x] `forge serve` HTTP recorder: drop-in proxy for any agent (Anthropic + OpenAI)
+- [x] Streaming pass-through in the recorder (SSE tee)
+- [x] Auto-threading via content-addressed prefix detection
+- [x] `forge web` embedded HTML viewer (single binary, no build pipeline)
+- [x] `examples/` with runnable scripts
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -103,7 +109,33 @@ forge diff <head-a> <head-b>
 # interactive TUI: timeline on the left, content on the right
 forge view <head>
 forge view <head-a> --diff <head-b>     # aligned diff with j/k navigation
+
+# local web viewer (single embedded HTML page, localhost only by default)
+forge web --port 7879
+
+# HTTP recorder — drop-in proxy for any existing agent
+forge serve --port 7878
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7878
+./my-existing-agent.py    # every API call now records into Forge
 ```
+
+## How it works with your existing agent
+
+Forge has three integration paths, in increasing order of friction:
+
+1. **HTTP recorder (`forge serve`)** — point your existing agent at the proxy
+   via `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`. Works with the Anthropic
+   and OpenAI SDKs in Python, TypeScript, Go, etc., and anything built on
+   top (LangChain, LlamaIndex, Rig, raw HTTP). Streaming responses are
+   teed; multi-turn calls are auto-threaded via content-addressed prefix
+   detection — no session id needed.
+2. **Native Rust integration** — use `forge-anthropic` / `forge-openai`
+   crates directly for the full agent + recording pipeline.
+3. **Direct graph access** — the run graph is just a sled DB on disk. Walk
+   it from any language without a Forge client.
+
+See the [`examples/`](examples/) directory for runnable scripts covering
+each path.
 
 End-to-end example (FakeAgent emits a 5-step conversation; we fork at the
 assistant's first message and diff):

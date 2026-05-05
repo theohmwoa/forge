@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod tui;
+mod web;
 
 use forge::{
     auto_run_tool_after_fork, diff_chains, fork_chain, print_chain, render_diff, run_agent,
@@ -108,6 +109,14 @@ enum Cmd {
     /// gets recorded as a Forge run.
     Serve {
         #[arg(long, default_value_t = 7878)]
+        port: u16,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+    /// Serve a local web viewer over the run graph. Single embedded HTML page
+    /// + JSON API; localhost-only by default.
+    Web {
+        #[arg(long, default_value_t = 7879)]
         port: u16,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
@@ -421,6 +430,18 @@ async fn run() -> anyhow::Result<()> {
             println!();
             println!("for an OpenAI client:");
             println!("  export OPENAI_BASE_URL=http://{addr}/v1");
+            println!();
+            println!("press ctrl-c to stop");
+            axum::serve(listener, app).await?;
+        }
+        Cmd::Web { port, host } => {
+            drop(storage);
+            let storage = Arc::new(SledStorage::open(&cli.db)?);
+            let app = web::router(web::WebState { storage });
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            println!("forge web viewer at http://{addr}");
+            println!("(shift-click two runs to diff them)");
             println!();
             println!("press ctrl-c to stop");
             axum::serve(listener, app).await?;

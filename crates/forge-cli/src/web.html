@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>forge</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --bg-alt: #161616;
+    --bg-hover: #1e1e1e;
+    --border: #2a2a2a;
+    --fg: #d4d4d4;
+    --muted: #777;
+    --accent: #61afef;
+    --prompt: #e5c07b;
+    --message-asst: #61afef;
+    --message-user: #d4d4d4;
+    --tool-call: #c678dd;
+    --tool-result: #98c379;
+    --modified: #e5c07b;
+    --only-a: #e06c75;
+    --only-b: #98c379;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    font-family: ui-monospace, "JetBrains Mono", "Menlo", monospace;
+    font-size: 13px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  #app {
+    display: grid;
+    grid-template-columns: 280px 360px 1fr;
+    height: 100vh;
+  }
+  #runs, #steps { border-right: 1px solid var(--border); overflow-y: auto; }
+  #content { overflow-y: auto; padding: 16px 20px; }
+  .hdr {
+    padding: 10px 14px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    z-index: 1;
+  }
+  .item {
+    padding: 8px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid #1a1a1a;
+    line-height: 1.45;
+  }
+  .item:hover { background: var(--bg-hover); }
+  .item.active { background: #252525; border-left: 2px solid var(--accent); padding-left: 12px; }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .step-prompt { color: var(--prompt); }
+  .step-message-assistant { color: var(--message-asst); }
+  .step-message-user { color: var(--message-user); }
+  .step-tool_call { color: var(--tool-call); }
+  .step-tool_result { color: var(--tool-result); }
+  pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+  h2 { font-size: 12px; font-weight: 600; color: var(--muted); margin: 0 0 10px 0; text-transform: uppercase; letter-spacing: 0.06em; }
+  .empty { color: var(--muted); padding: 14px; font-style: italic; }
+  .marker { display: inline-block; width: 18px; color: var(--muted); }
+  .marker.modified { color: var(--modified); }
+  .marker.only-a { color: var(--only-a); }
+  .marker.only-b { color: var(--only-b); }
+  .toolbar {
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-alt);
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .toolbar button {
+    background: #222;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 4px 10px;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .toolbar button:hover { background: #2a2a2a; }
+  .toolbar button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .pill {
+    display: inline-block;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--bg-hover);
+    color: var(--muted);
+    margin-left: 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .diff-A pre { color: var(--only-a); }
+  .diff-B pre { color: var(--only-b); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="runs"></div>
+  <div id="steps"></div>
+  <div id="content"></div>
+</div>
+
+<script>
+const state = {
+  runs: [],
+  selectedRun: null,
+  diffWith: null,
+  chain: [],
+  aligned: null,
+  selectedStep: null,
+  selectedAligned: null,
+};
+
+async function fetchJSON(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function short(s) { return s ? s.slice(0, 10) : ''; }
+
+function stepLabel(s) {
+  switch (s.kind.type) {
+    case 'prompt': return `prompt[${s.kind.model}]`;
+    case 'message': return `message[${s.kind.role}]`;
+    case 'tool_call': return `tool_call[${s.kind.name}]`;
+    case 'tool_result': return `tool_result[${s.kind.call_id}]`;
+  }
+  return s.kind.type;
+}
+
+function stepClass(s) {
+  if (s.kind.type === 'message') return 'step-message-' + s.kind.role;
+  return 'step-' + s.kind.type;
+}
+
+function stepBody(s) {
+  switch (s.kind.type) {
+    case 'prompt':
+    case 'message':
+      return s.kind.content;
+    case 'tool_call':
+      return JSON.stringify(s.kind.input, null, 2);
+    case 'tool_result':
+      return JSON.stringify(s.kind.output, null, 2);
+  }
+  return '';
+}
+
+async function loadRuns() {
+  const r = await fetchJSON('/api/runs');
+  state.runs = r.runs || [];
+  renderRuns();
+}
+
+function renderRuns() {
+  const el = document.getElementById('runs');
+  if (!state.runs.length) {
+    el.innerHTML = '<div class="hdr">runs</div><div class="empty">no recorded runs</div>';
+    return;
+  }
+  const items = state.runs.map(r => {
+    const active = state.selectedRun === r.head ? 'active' : '';
+    const isDiffWith = state.diffWith === r.head ? '<span class="pill">B</span>' : '';
+    const date = new Date(r.recorded_at_ms).toLocaleString();
+    return `
+      <div class="item ${active}" data-head="${r.head}">
+        <div>${short(r.head)} ${isDiffWith}</div>
+        <div class="meta">${date}</div>
+      </div>`;
+  }).join('');
+  el.innerHTML = '<div class="hdr">runs (' + state.runs.length + ')</div>' + items;
+  el.querySelectorAll('.item').forEach(item => {
+    item.onclick = (e) => {
+      const head = item.dataset.head;
+      if (e.shiftKey && state.selectedRun && state.selectedRun !== head) {
+        loadDiff(state.selectedRun, head);
+      } else {
+        loadRun(head);
+      }
+    };
+  });
+}
+
+async function loadRun(head) {
+  state.selectedRun = head;
+  state.diffWith = null;
+  state.aligned = null;
+  state.selectedAligned = null;
+  const r = await fetchJSON('/api/runs/' + head);
+  state.chain = r.chain || [];
+  state.selectedStep = state.chain[0] || null;
+  renderRuns();
+  renderSteps();
+  renderContent();
+}
+
+async function loadDiff(a, b) {
+  state.selectedRun = a;
+  state.diffWith = b;
+  state.selectedStep = null;
+  const r = await fetchJSON('/api/diff/' + a + '/' + b);
+  state.chain = [];
+  state.aligned = r;
+  state.selectedAligned = (r.prefix && r.prefix[0]) ? { kind: 'match', step: r.prefix[0] } : (r.aligned[0] || null);
+  renderRuns();
+  renderSteps();
+  renderContent();
+}
+
+function renderSteps() {
+  const el = document.getElementById('steps');
+  if (state.aligned) {
+    const prefixItems = (state.aligned.prefix || []).map(s => `
+      <div class="item ${stepClass(s)}" data-aligned='${JSON.stringify({kind:'match', step:s}).replace(/'/g,"&#39;")}'>
+        <span class="marker">=</span>${short(s.id)} ${stepLabel(s)}
+      </div>`).join('');
+    const alignedItems = (state.aligned.aligned || []).map(a => {
+      const display = a.kind === 'modified' ? a.a : (a.kind === 'only_a' ? a.step : (a.kind === 'only_b' ? a.step : a.step));
+      const marker = a.kind === 'match' ? '=' : a.kind === 'modified' ? '~' : a.kind === 'only_a' ? '−' : '+';
+      const cls = a.kind === 'modified' ? 'modified' : a.kind === 'only_a' ? 'only-a' : a.kind === 'only_b' ? 'only-b' : '';
+      return `
+      <div class="item ${stepClass(display)}" data-aligned='${JSON.stringify(a).replace(/'/g,"&#39;")}'>
+        <span class="marker ${cls}">${marker}</span>${short(display.id)} ${stepLabel(display)}
+      </div>`;
+    }).join('');
+    el.innerHTML = '<div class="hdr">diff · ' + (state.aligned.common_prefix_len) + ' shared · ' + (state.aligned.aligned || []).length + ' divergent</div>' + prefixItems + alignedItems;
+    el.querySelectorAll('.item').forEach(item => {
+      item.onclick = () => {
+        state.selectedAligned = JSON.parse(item.dataset.aligned.replace(/&#39;/g, "'"));
+        renderContent();
+      };
+    });
+    return;
+  }
+  if (!state.chain.length) {
+    el.innerHTML = '<div class="hdr">steps</div><div class="empty">select a run</div>';
+    return;
+  }
+  const items = state.chain.map(s => {
+    const active = state.selectedStep && state.selectedStep.id === s.id ? 'active' : '';
+    return `
+      <div class="item ${stepClass(s)} ${active}" data-id="${s.id}">
+        <span class="marker"></span>${short(s.id)} ${stepLabel(s)}
+      </div>`;
+  }).join('');
+  el.innerHTML = '<div class="hdr">' + state.chain.length + ' steps</div>' + items;
+  el.querySelectorAll('.item').forEach(item => {
+    item.onclick = () => {
+      state.selectedStep = state.chain.find(s => s.id === item.dataset.id);
+      renderSteps();
+      renderContent();
+    };
+  });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]);
+}
+
+function renderContent() {
+  const el = document.getElementById('content');
+  if (state.aligned && state.selectedAligned) {
+    const a = state.selectedAligned;
+    if (a.kind === 'modified') {
+      el.innerHTML = `
+        <h2>modified · ${stepLabel(a.a)}</h2>
+        <div class="diff-A"><h2>A</h2><pre>${escapeHtml(stepBody(a.a))}</pre></div>
+        <div style="height: 12px"></div>
+        <div class="diff-B"><h2>B</h2><pre>${escapeHtml(stepBody(a.b))}</pre></div>`;
+    } else if (a.kind === 'only_a') {
+      el.innerHTML = `<h2 style="color: var(--only-a)">only in A · ${stepLabel(a.step)}</h2><pre>${escapeHtml(stepBody(a.step))}</pre>`;
+    } else if (a.kind === 'only_b') {
+      el.innerHTML = `<h2 style="color: var(--only-b)">only in B · ${stepLabel(a.step)}</h2><pre>${escapeHtml(stepBody(a.step))}</pre>`;
+    } else {
+      el.innerHTML = `<h2>shared · ${stepLabel(a.step)}</h2><pre>${escapeHtml(stepBody(a.step))}</pre>`;
+    }
+    return;
+  }
+  if (!state.selectedStep) {
+    el.innerHTML = '<div class="empty">select a run on the left, or shift-click two runs to diff them</div>';
+    return;
+  }
+  const s = state.selectedStep;
+  el.innerHTML = `
+    <h2>${stepLabel(s)} · ${s.id}</h2>
+    <pre>${escapeHtml(stepBody(s))}</pre>`;
+}
+
+loadRuns();
+setInterval(loadRuns, 5000);
+</script>
+</body>
+</html>
