@@ -1,27 +1,40 @@
 # forge
 
-**Git for agent runs.** Content-addressed, branchable, diffable, *and* auditable for cost.
+**A tool-aware model router for agent loops** — plus a content-addressed run graph that makes every part of the loop inspectable, branchable, and replayable.
 
 > Status: very early. Public design exploration. APIs will break.
 
-## TL;DR
+## TL;DR — route different tools to different models in the same agent loop
+
+```bash
+$ forge run --tools web_search,execute_sql,screenshot \
+    --model claude-sonnet-4-6 \
+    --after-tool web_search:claude-haiku-4-5-20251001 \
+    --after-tool execute_sql:openai/ft:gpt-4o-mini:org:sql-v3 \
+    --after-tool screenshot:gemini/gemini-2.5-flash \
+    --prompt "..."
+```
+
+Every tool boundary is a swap point. After a specific tool's result lands, the next turn uses a model picked for that tool:
+
+- **Cost** — cheap models digest mechanical tool output; smart models plan and synthesize
+- **Specialization** — SQL-fine-tuned model after `execute_sql`, code-fine-tuned after `run_tests`, vision after `screenshot`
+- **Privacy** — local model after a tool that returned PII so the cloud model never sees the sensitive payload
+- **Modality** — vision-only model only when an image was just produced
+
+The router is keyed on the most recent `ToolCall` in the chain, evaluated fresh each cycle. Rules are `tool:[provider/]model`. No rule for a tool means the default (`--model`) handles that turn. Cross-provider rules work because the run graph is provider-neutral; each adapter translates the prefix into its own wire format.
+
+## Plus: a graph, not a log
 
 ```bash
 $ forge audit --target-model claude-haiku-4-5 --judge-model claude-sonnet-4-6
-auditing 52 run(s) against claude-haiku-4-5 (judge: claude-sonnet-4-6)
+auditing 52 run(s) against claude-haiku-4-5
 
   ✓  47 EQUIVALENT  — safe to downgrade
   ⚠   5 DIFFERENT   — keep on the original model
-
-differences:
-  • 4ca7b22f  haiku missed 2 of 3 entities
-  • 9f8e1ad3  haiku hallucinated a fourth field
-  ...
-
-review the 47 downgrades in forge web (tag: audit-claude-haiku-4-5).
 ```
 
-Industry consensus in 2026: 80% of agent API calls don't need a frontier model. The hard part is figuring out *which* 80%. Forge replays each recorded run through a cheaper model, uses a strong model as judge, and tells you what's safe to downgrade.
+`forge audit` measures per-prompt downgrade safety against your real recorded runs, with an LLM judge. The audit and the routing close the loop: measure → derive rules → apply.
 
 ## What it is
 
@@ -96,6 +109,8 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `forge-rig` crate to record a [Rig](https://rig.rs) conversation
 - [x] `forge bisect` — git-bisect for agent runs (find the step that caused a failure)
 - [x] `forge audit` — replay recorded runs against cheaper models, judge equivalence, surface safe downgrades
+- [x] `forge run --after-tool` — tool-aware per-turn model routing (cost / specialization / privacy)
+- [ ] `forge audit --by-tool` — derive routing rules empirically from per-tool downgrade safety
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"

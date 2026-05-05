@@ -964,6 +964,196 @@ fn one_line(s: &str, max: usize) -> String {
     }
 }
 
+// -- route -----------------------------------------------------------------
+//
+// Tool-aware model routing for agent loops. Every tool boundary is a swap
+// point: after a specific tool's result lands, route the next turn to a
+// model picked for that tool. Use cases:
+// - cost: cheap models digest mechanical tool output (search results, file
+//   listings) while smart models handle the rest
+// - specialization: SQL-tuned model after `execute_sql`, code-tuned after
+//   `run_tests`, vision after `screenshot`
+// - privacy: local model after a tool that returned PII so the cloud model
+//   never sees the sensitive payload
+//
+// The orchestrator drives one max_turns=1 cycle at a time. After each
+// cycle, it inspects the chain for the most recent ToolCall step and looks
+// up the rule for that tool's name. If none, the default model is used.
+// First turn always uses the default (no tool has run yet).
+
+/// Routing target = (provider, model). Provider is identified by string so
+/// this module stays decoupled from `AgentKind` in `main.rs` — the caller's
+/// `build_agent` closure resolves provider strings into concrete agents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTarget {
+    pub provider: String,
+    pub model: String,
+}
+
+impl RouteTarget {
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+}
+
+/// Parse `tool:provider/model` or `tool:model` (provider falls back to
+/// `default_provider`). Returns `(tool_name, RouteTarget)`.
+pub fn parse_route_rule(
+    raw: &str,
+    default_provider: &str,
+) -> anyhow::Result<(String, RouteTarget)> {
+    let (tool, rest) = raw
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("rule {raw:?} must be tool:[provider/]model"))?;
+    if tool.is_empty() {
+        anyhow::bail!("rule {raw:?} has empty tool name");
+    }
+    let target = match rest.split_once('/') {
+        Some((provider, model)) => RouteTarget::new(provider.trim(), model.trim()),
+        None => RouteTarget::new(default_provider, rest.trim()),
+    };
+    if target.model.is_empty() {
+        anyhow::bail!("rule {raw:?} has empty model");
+    }
+    Ok((tool.trim().to_string(), target))
+}
+
+/// Drive a routed agent loop. The agent factory receives a `RouteTarget`
+/// (provider + model) plus an optional prefix — `None` for the first turn
+/// (build a fresh agent with the user prompt baked in), `Some(prefix)` for
+/// subsequent turns (build a continuing agent threading the prefix).
+///
+/// Each cycle uses `max_turns=1` internally; the orchestrator handles the
+/// outer loop and the per-cycle model selection.
+pub async fn run_routed<S, B>(
+    storage: &S,
+    default: RouteTarget,
+    rules: &std::collections::HashMap<String, RouteTarget>,
+    max_turns: usize,
+    mut build_agent: B,
+) -> anyhow::Result<RoutedRun>
+where
+    S: Storage + ?Sized,
+    B: FnMut(&RouteTarget, Option<&[Step]>) -> anyhow::Result<Box<dyn Agent>>,
+{
+    let mut prefix: Vec<Step> = Vec::new();
+    let mut chain: Vec<NodeHash> = Vec::new();
+    let mut cycle_log: Vec<RoutedCycle> = Vec::new();
+
+    for cycle in 0..max_turns {
+        // Pick the target. Cycle 0 always uses the default; subsequent
+        // cycles look up the rule for the most recent ToolCall name.
+        let target = if cycle == 0 {
+            default.clone()
+        } else {
+            let last_tool = last_tool_call_name(&prefix);
+            last_tool
+                .as_deref()
+                .and_then(|name| rules.get(name).cloned())
+                .unwrap_or_else(|| default.clone())
+        };
+
+        let prefix_arg = if cycle == 0 {
+            None
+        } else {
+            Some(prefix.as_slice())
+        };
+        let mut agent = build_agent(&target, prefix_arg)?;
+
+        let parent = prefix.last().map(|s| s.id.clone());
+        let new_hashes = run_agent_from(parent, agent.as_mut(), storage).await?;
+
+        if new_hashes.is_empty() {
+            // Agent emitted nothing — defensive break, shouldn't happen.
+            cycle_log.push(RoutedCycle {
+                target,
+                last_tool: None,
+                emitted: 0,
+            });
+            break;
+        }
+
+        let mut new_steps_for_log = 0usize;
+        for h in &new_hashes {
+            let step = storage
+                .get(h)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("step missing after routed cycle: {h}"))?;
+            prefix.push(step);
+            new_steps_for_log += 1;
+        }
+        chain.extend(new_hashes);
+
+        cycle_log.push(RoutedCycle {
+            target,
+            last_tool: last_tool_call_name(&prefix),
+            emitted: new_steps_for_log,
+        });
+
+        // Termination: the cycle produced a final assistant message (no
+        // following tool_call). After Anthropic's `fire(max_turns=1)` the
+        // last step is either a Message (text-only response, done) or a
+        // ToolResult (more work pending).
+        match prefix.last().map(|s| &s.kind) {
+            Some(StepKind::Message { role, .. }) if role == "assistant" => break,
+            _ => {} // continue
+        }
+    }
+
+    Ok(RoutedRun {
+        chain,
+        cycles: cycle_log,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutedRun {
+    pub chain: Vec<NodeHash>,
+    pub cycles: Vec<RoutedCycle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutedCycle {
+    /// Model that handled this cycle.
+    pub target: RouteTarget,
+    /// Tool whose result preceded this cycle (`None` for cycle 0).
+    pub last_tool: Option<String>,
+    /// Steps emitted in this cycle.
+    pub emitted: usize,
+}
+
+/// Walk a chain backwards and return the most recent `ToolCall.name`. Used
+/// by `run_routed` to pick the model for the next cycle.
+pub fn last_tool_call_name(prefix: &[Step]) -> Option<String> {
+    for s in prefix.iter().rev() {
+        if let StepKind::ToolCall { name, .. } = &s.kind {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+pub fn render_routed(run: &RoutedRun) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("routed run: {} cycle(s)\n\n", run.cycles.len()));
+    for (i, c) in run.cycles.iter().enumerate() {
+        let context = match &c.last_tool {
+            Some(t) => format!("after {t}"),
+            None => "initial".into(),
+        };
+        out.push_str(&format!(
+            "  cycle {i:>2}  [{context:<20}]  {provider}/{model}  +{emitted} step(s)\n",
+            provider = c.target.provider,
+            model = c.target.model,
+            emitted = c.emitted,
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1642,5 +1832,220 @@ mod tests {
         assert_eq!(summary.equivalent_count(), 1);
         assert_eq!(summary.different_count(), 1);
         assert_eq!(summary.inconclusive_count(), 0);
+    }
+
+    #[test]
+    fn parse_route_rule_handles_both_forms() {
+        let (tool, target) = parse_route_rule("search:claude-haiku-4-5", "anthropic").unwrap();
+        assert_eq!(tool, "search");
+        assert_eq!(target.provider, "anthropic");
+        assert_eq!(target.model, "claude-haiku-4-5");
+
+        let (tool, target) = parse_route_rule("execute_sql:openai/ft-sql-v3", "anthropic").unwrap();
+        assert_eq!(tool, "execute_sql");
+        assert_eq!(target.provider, "openai");
+        assert_eq!(target.model, "ft-sql-v3");
+
+        // Whitespace tolerance.
+        let (tool, target) = parse_route_rule("  s : openai / m  ", "anthropic").unwrap();
+        assert_eq!(tool, "s");
+        assert_eq!(target.provider, "openai");
+        assert_eq!(target.model, "m");
+
+        // Reject malformed.
+        assert!(parse_route_rule("noColon", "anthropic").is_err());
+        assert!(parse_route_rule(":missing-tool", "anthropic").is_err());
+        assert!(parse_route_rule("tool:", "anthropic").is_err());
+    }
+
+    #[test]
+    fn last_tool_call_name_walks_back() {
+        let chain = vec![
+            Step::new(
+                None,
+                StepKind::Prompt {
+                    model: "m".into(),
+                    content: "go".into(),
+                },
+                0,
+            ),
+            Step::new(None, msg("assistant", "ok"), 0),
+            Step::new(
+                None,
+                StepKind::ToolCall {
+                    call_id: "1".into(),
+                    name: "search".into(),
+                    input: serde_json::json!({}),
+                },
+                0,
+            ),
+            Step::new(
+                None,
+                StepKind::ToolResult {
+                    call_id: "1".into(),
+                    output: serde_json::json!("results"),
+                },
+                0,
+            ),
+        ];
+        assert_eq!(last_tool_call_name(&chain), Some("search".into()));
+
+        // No tool calls at all: returns None.
+        let chain = vec![Step::new(
+            None,
+            StepKind::Prompt {
+                model: "m".into(),
+                content: "x".into(),
+            },
+            0,
+        )];
+        assert_eq!(last_tool_call_name(&chain), None);
+    }
+
+    /// A single-cycle test agent: emits one Message + one ToolCall +
+    /// one ToolResult on first call, then a final Message on second call.
+    /// We use this to verify the routed orchestrator picks the right model
+    /// per cycle.
+    struct TwoCycleAgent {
+        prefix_seen: Vec<Step>,
+        emitted: usize,
+        first_message: String,
+        second_message: String,
+        tool_name: String,
+    }
+    impl TwoCycleAgent {
+        fn cycle1(tool: &str, msg: &str) -> Self {
+            Self {
+                prefix_seen: Vec::new(),
+                emitted: 0,
+                first_message: msg.into(),
+                second_message: String::new(),
+                tool_name: tool.into(),
+            }
+        }
+        fn cycle2(prefix: Vec<Step>, msg: &str) -> Self {
+            Self {
+                prefix_seen: prefix,
+                emitted: 0,
+                first_message: String::new(),
+                second_message: msg.into(),
+                tool_name: String::new(),
+            }
+        }
+    }
+    #[async_trait]
+    impl Agent for TwoCycleAgent {
+        async fn next_step(&mut self, _parent: Option<NodeHash>) -> Option<StepKind> {
+            let n = self.emitted;
+            self.emitted += 1;
+            // Cycle 1 (no prefix seen): emit Message + ToolCall + ToolResult
+            // Cycle 2 (prefix seen): emit final Message
+            if self.prefix_seen.is_empty() {
+                match n {
+                    0 => Some(StepKind::Message {
+                        role: "assistant".into(),
+                        content: self.first_message.clone(),
+                    }),
+                    1 => Some(StepKind::ToolCall {
+                        call_id: "t1".into(),
+                        name: self.tool_name.clone(),
+                        input: serde_json::json!({}),
+                    }),
+                    2 => Some(StepKind::ToolResult {
+                        call_id: "t1".into(),
+                        output: serde_json::json!("result"),
+                    }),
+                    _ => None,
+                }
+            } else {
+                match n {
+                    0 => Some(StepKind::Message {
+                        role: "assistant".into(),
+                        content: self.second_message.clone(),
+                    }),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_routed_picks_rule_target_after_tool() {
+        use std::collections::HashMap;
+        let storage = MemoryStorage::new();
+
+        let default = RouteTarget::new("anthropic", "sonnet");
+        let mut rules = HashMap::new();
+        rules.insert("search".to_string(), RouteTarget::new("anthropic", "haiku"));
+
+        // The factory records what target was requested per cycle so we
+        // can assert routing happened.
+        let mut targets_log = Vec::new();
+        let recording = |t: &RouteTarget, prefix: Option<&[Step]>| {
+            targets_log.push(t.clone());
+            let agent: Box<dyn Agent> = match prefix {
+                None => Box::new(TwoCycleAgent::cycle1("search", "I'll search.")),
+                Some(p) => Box::new(TwoCycleAgent::cycle2(
+                    p.to_vec(),
+                    "Final answer based on search.",
+                )),
+            };
+            Ok(agent)
+        };
+        let result = run_routed(&storage, default.clone(), &rules, 8, recording)
+            .await
+            .unwrap();
+
+        assert_eq!(targets_log.len(), 2, "should have run 2 cycles");
+        assert_eq!(targets_log[0], default, "cycle 0 uses default");
+        assert_eq!(
+            targets_log[1].model, "haiku",
+            "cycle 1 uses rule for `search`"
+        );
+
+        assert_eq!(result.cycles.len(), 2);
+        assert_eq!(result.cycles[0].last_tool, Some("search".into()));
+        assert_eq!(result.cycles[1].target.model, "haiku");
+        // Final message landed.
+        let last_step = storage
+            .get(result.chain.last().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        match last_step.kind {
+            StepKind::Message { role, content } => {
+                assert_eq!(role, "assistant");
+                assert!(content.contains("Final answer"));
+            }
+            _ => panic!("expected final assistant message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_routed_falls_back_to_default_for_unmatched_tool() {
+        use std::collections::HashMap;
+        let storage = MemoryStorage::new();
+        let default = RouteTarget::new("anthropic", "sonnet");
+        let mut rules = HashMap::new();
+        // Rule for a different tool than the agent will call.
+        rules.insert("calculator".into(), RouteTarget::new("anthropic", "haiku"));
+
+        let mut targets_log = Vec::new();
+        let recording = |t: &RouteTarget, p: Option<&[Step]>| {
+            targets_log.push(t.clone());
+            let agent: Box<dyn Agent> = match p {
+                None => Box::new(TwoCycleAgent::cycle1(
+                    "search", // ← agent calls search; rule is for calculator
+                    "I'll search.",
+                )),
+                Some(p) => Box::new(TwoCycleAgent::cycle2(p.to_vec(), "Done.")),
+            };
+            Ok(agent)
+        };
+
+        let result = run_routed(&storage, default.clone(), &rules, 4, recording)
+            .await
+            .unwrap();
+        assert_eq!(result.cycles[1].target, default, "no rule → default");
     }
 }

@@ -8,7 +8,8 @@ mod web;
 
 use forge::{
     audit_runs, auto_run_tool_after_fork, bisect_chains, default_bisect_check, diff_chains,
-    fork_chain, print_chain, render_audit, render_bisect, render_diff, run_agent, run_agent_from,
+    fork_chain, parse_route_rule, print_chain, render_audit, render_bisect, render_diff,
+    render_routed, run_agent, run_agent_from, run_routed, RouteTarget,
 };
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
@@ -63,6 +64,15 @@ enum Cmd {
         /// Free-form tag to attach to this run for later filtering.
         #[arg(long)]
         tag: Option<String>,
+        /// Tool-keyed routing rule: `tool:[provider/]model`. Repeatable.
+        /// When the previous step is a `tool_result` for the named tool,
+        /// the next agent turn uses this model. Provider falls back to
+        /// `--agent`. Examples:
+        ///   --after-tool web_search:claude-haiku-4-5-20251001
+        ///   --after-tool execute_sql:openai/ft:gpt-4o-mini:org:sql-v3
+        ///   --after-tool screenshot:gemini/gemini-2.5-flash
+        #[arg(long, value_name = "TOOL:MODEL")]
+        after_tool: Vec<String>,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay { head: String },
@@ -346,13 +356,73 @@ async fn run() -> anyhow::Result<()> {
             max_turns,
             stream,
             tag,
+            after_tool,
         } => {
             let tool_set = build_tools(&tools);
-            let mut agent = build_fresh_agent(agent, prompt, model, tool_set, max_turns, stream)?;
-            let chain = run_agent(agent.as_mut(), &*storage).await?;
-            if chain.is_empty() {
-                anyhow::bail!("agent emitted no steps; nothing to record");
-            }
+
+            let chain = if after_tool.is_empty() {
+                // Plain path: single model handles every turn (existing flow).
+                let mut agent =
+                    build_fresh_agent(agent, prompt, model, tool_set, max_turns, stream)?;
+                let chain = run_agent(agent.as_mut(), &*storage).await?;
+                if chain.is_empty() {
+                    anyhow::bail!("agent emitted no steps; nothing to record");
+                }
+                chain
+            } else {
+                // Routed path: per-cycle model swaps based on the rule map.
+                let prompt_str = prompt
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--prompt is required when using --after-tool"))?
+                    .clone();
+                let default_provider = agent_kind_label(agent);
+                let default_target = RouteTarget::new(default_provider, model.clone());
+
+                let mut rules = std::collections::HashMap::new();
+                for raw in &after_tool {
+                    let (tool, target) = parse_route_rule(raw, default_provider)?;
+                    rules.insert(tool, target);
+                }
+
+                println!(
+                    "routing enabled · default {default_provider}/{model} · {} rule(s)",
+                    rules.len()
+                );
+
+                let prompt_owned = prompt_str.clone();
+                let tools_for_factory = tool_set.clone();
+                let factory = move |target: &RouteTarget,
+                                    prefix: Option<&[Step]>|
+                      -> anyhow::Result<Box<dyn Agent>> {
+                    let kind = parse_agent_kind(&target.provider)?;
+                    if let Some(prefix) = prefix {
+                        build_continuing_agent(
+                            kind,
+                            prefix,
+                            target.model.clone(),
+                            tools_for_factory.clone(),
+                            Some(1),
+                        )
+                    } else {
+                        build_fresh_agent(
+                            kind,
+                            Some(prompt_owned.clone()),
+                            target.model.clone(),
+                            tools_for_factory.clone(),
+                            Some(1),
+                            false,
+                        )
+                    }
+                };
+                let cap = max_turns.unwrap_or(16);
+                let result = run_routed(&*storage, default_target, &rules, cap, factory).await?;
+                if result.chain.is_empty() {
+                    anyhow::bail!("routed agent emitted no steps; nothing to record");
+                }
+                println!("\n{}", render_routed(&result));
+                result.chain
+            };
+
             let head = chain.last().cloned().unwrap();
             let root = chain.first().cloned().unwrap();
             storage
@@ -744,4 +814,26 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Stable provider string used in routing rules.
+fn agent_kind_label(kind: AgentKind) -> &'static str {
+    match kind {
+        AgentKind::Fake => "fake",
+        AgentKind::Anthropic => "anthropic",
+        AgentKind::Openai => "openai",
+        AgentKind::Gemini => "gemini",
+    }
+}
+
+fn parse_agent_kind(label: &str) -> anyhow::Result<AgentKind> {
+    match label {
+        "fake" => Ok(AgentKind::Fake),
+        "anthropic" => Ok(AgentKind::Anthropic),
+        "openai" => Ok(AgentKind::Openai),
+        "gemini" => Ok(AgentKind::Gemini),
+        other => anyhow::bail!(
+            "unknown provider in routing rule: {other:?} (expected fake / anthropic / openai / gemini)"
+        ),
+    }
 }
