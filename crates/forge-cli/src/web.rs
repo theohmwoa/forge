@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -16,6 +16,7 @@ use axum::{
 use forge::diff_chains;
 use forge_core::NodeHash;
 use forge_storage::Storage;
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 const INDEX_HTML: &str = include_str!("./web.html");
@@ -38,8 +39,19 @@ async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
-async fn list_runs(State(s): State<WebState>) -> Result<Json<Value>, ApiError> {
-    let runs = s.storage.list_runs().await?;
+#[derive(Deserialize)]
+struct ListRunsQuery {
+    tag: Option<String>,
+}
+
+async fn list_runs(
+    State(s): State<WebState>,
+    Query(q): Query<ListRunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let mut runs = s.storage.list_runs().await?;
+    if let Some(tag) = q.tag.as_deref() {
+        runs.retain(|r| r.tag.as_deref() == Some(tag));
+    }
     Ok(Json(json!({ "runs": runs })))
 }
 

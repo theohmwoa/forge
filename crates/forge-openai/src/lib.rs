@@ -374,6 +374,76 @@ impl Agent for OpenAIAgent {
     }
 }
 
+/// Parse a complete OpenAI SSE stream body (concatenated `chat.completion.chunk`
+/// events) into the same `{choices: [{message, finish_reason}]}` shape as a
+/// non-streaming response. Used by the recorder to tee an upstream stream and
+/// then convert the captured body into Forge steps.
+pub fn parse_openai_sse_body(body: &str) -> serde_json::Value {
+    let mut content = String::new();
+    let mut finish_reason = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+
+    for chunk in body.split("\n\n") {
+        let data: String = chunk
+            .lines()
+            .filter(|l| l.starts_with("data:"))
+            .map(|l| l.trim_start_matches("data:").trim())
+            .collect::<Vec<_>>()
+            .join("");
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = match serde_json::from_str(&data) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let delta = &event["choices"][0]["delta"];
+        if let Some(text) = delta["content"].as_str() {
+            content.push_str(text);
+        }
+        if let Some(deltas) = delta["tool_calls"].as_array() {
+            for d in deltas {
+                let idx = d["index"].as_u64().unwrap_or(0) as usize;
+                while tool_calls.len() <= idx {
+                    tool_calls.push(json!({
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""}
+                    }));
+                }
+                if let Some(id) = d["id"].as_str() {
+                    tool_calls[idx]["id"] = json!(id);
+                }
+                if let Some(name) = d["function"]["name"].as_str() {
+                    tool_calls[idx]["function"]["name"] = json!(name);
+                }
+                if let Some(args) = d["function"]["arguments"].as_str() {
+                    let existing = tool_calls[idx]["function"]["arguments"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    tool_calls[idx]["function"]["arguments"] = json!(format!("{existing}{args}"));
+                }
+            }
+        }
+        if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
+            finish_reason = fr.to_string();
+        }
+    }
+
+    let mut message = json!({ "role": "assistant", "content": content });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+        message["content"] = Value::Null;
+    }
+    json!({
+        "choices": [{
+            "message": message,
+            "finish_reason": finish_reason,
+        }]
+    })
+}
+
 /// Translate a Forge step prefix into the OpenAI Chat Completions message
 /// shape. Tool calls live inside the assistant message; tool results are
 /// separate `role: "tool"` messages keyed by `tool_call_id`.

@@ -44,6 +44,7 @@ async fn proxy_anthropic(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, (StatusCode, String)> {
+    let tag = extract_tag(&headers);
     let mut req = state.client.post(ANTHROPIC_UPSTREAM);
     for name in &["x-api-key", "anthropic-version", "anthropic-beta"] {
         if let Some(v) = headers.get(*name) {
@@ -77,6 +78,7 @@ async fn proxy_anthropic(
         let captured_for_stream = Arc::clone(&captured);
         let storage = Arc::clone(&state.storage);
         let request_for_finalize = body.clone();
+        let tag_for_finalize = tag.clone();
 
         let upstream_stream = upstream.bytes_stream().map(move |chunk| match chunk {
             Ok(bytes) => {
@@ -98,8 +100,13 @@ async fn proxy_anthropic(
                 .unwrap_or_default();
             let raw = String::from_utf8_lossy(&bytes).to_string();
             let response_body = forge_anthropic::parse_anthropic_sse_body(&raw);
-            if let Err(err) =
-                record_anthropic(&*storage, &request_for_finalize, &response_body).await
+            if let Err(err) = record_anthropic(
+                &*storage,
+                &request_for_finalize,
+                &response_body,
+                tag_for_finalize.clone(),
+            )
+            .await
             {
                 tracing::warn!(?err, "failed to record streamed anthropic run");
             }
@@ -120,7 +127,7 @@ async fn proxy_anthropic(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    if let Err(err) = record_anthropic(&*state.storage, &body, &response_body).await {
+    if let Err(err) = record_anthropic(&*state.storage, &body, &response_body, tag).await {
         tracing::warn!(?err, "failed to record anthropic round-trip");
     }
     Ok(Json(response_body).into_response())
@@ -129,16 +136,9 @@ async fn proxy_anthropic(
 async fn proxy_openai(
     State(state): State<Arc<RecorderState>>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    if body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        tracing::warn!("recorder does not yet tee streaming responses; stripping stream=true");
-        body["stream"] = json!(false);
-    }
+    Json(body): Json<Value>,
+) -> Result<Response, (StatusCode, String)> {
+    let tag = extract_tag(&headers);
     let mut req = state.client.post(OPENAI_UPSTREAM);
     if let Some(v) = headers.get("authorization") {
         req = req.header("authorization", v);
@@ -146,28 +146,88 @@ async fn proxy_openai(
     if let Some(v) = headers.get("openai-organization") {
         req = req.header("openai-organization", v);
     }
-    let resp = req
+    let upstream = req
         .header("content-type", "application/json")
         .json(&body)
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
-    let status = resp.status();
-    let response_body: Value = resp
-        .json()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let status = upstream.status();
     if !status.is_success() {
+        let err_body: Value = upstream.json().await.unwrap_or_else(|_| json!({}));
         return Err((
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            response_body.to_string(),
+            err_body.to_string(),
         ));
     }
 
-    if let Err(err) = record_openai(&*state.storage, &body, &response_body).await {
+    let is_stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if is_stream {
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_for_stream = Arc::clone(&captured);
+        let storage = Arc::clone(&state.storage);
+        let request_for_finalize = body.clone();
+        let tag_for_finalize = tag.clone();
+
+        let upstream_stream = upstream.bytes_stream().map(move |chunk| match chunk {
+            Ok(bytes) => {
+                if let Ok(mut buf) = captured_for_stream.lock() {
+                    buf.extend_from_slice(&bytes);
+                }
+                Ok::<_, std::io::Error>(bytes)
+            }
+            Err(e) => Err(std::io::Error::other(e)),
+        });
+
+        let captured_for_finalize = Arc::clone(&captured);
+        let finalize = stream::once(async move {
+            let bytes = captured_for_finalize
+                .lock()
+                .map(|b| b.clone())
+                .unwrap_or_default();
+            let raw = String::from_utf8_lossy(&bytes).to_string();
+            let response_body = forge_openai::parse_openai_sse_body(&raw);
+            if let Err(err) = record_openai(
+                &*storage,
+                &request_for_finalize,
+                &response_body,
+                tag_for_finalize.clone(),
+            )
+            .await
+            {
+                tracing::warn!(?err, "failed to record streamed openai run");
+            }
+            Ok::<_, std::io::Error>(bytes::Bytes::new())
+        });
+
+        let body_stream = upstream_stream.chain(finalize);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .body(Body::from_stream(body_stream))
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    }
+
+    let response_body: Value = upstream
+        .json()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    if let Err(err) = record_openai(&*state.storage, &body, &response_body, tag).await {
         tracing::warn!(?err, "failed to record openai round-trip");
     }
-    Ok(Json(response_body))
+    Ok(Json(response_body).into_response())
+}
+
+fn extract_tag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forge-tag")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// Convert an Anthropic request+response into a Forge run. Multi-call
@@ -181,6 +241,7 @@ async fn record_anthropic(
     storage: &dyn Storage,
     request: &Value,
     response: &Value,
+    tag: Option<String>,
 ) -> anyhow::Result<()> {
     let model = request["model"].as_str().unwrap_or("unknown").to_string();
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
@@ -235,6 +296,7 @@ async fn record_anthropic(
                 head: head.clone(),
                 root: root.clone(),
                 recorded_at_ms: now,
+                tag,
             })
             .await?;
         tracing::info!(
@@ -323,6 +385,7 @@ async fn record_openai(
     storage: &dyn Storage,
     request: &Value,
     response: &Value,
+    tag: Option<String>,
 ) -> anyhow::Result<()> {
     let model = request["model"].as_str().unwrap_or("unknown").to_string();
     let messages = request["messages"].as_array().cloned().unwrap_or_default();
@@ -399,6 +462,7 @@ async fn record_openai(
                 head: head.clone(),
                 root: root.clone(),
                 recorded_at_ms: now,
+                tag,
             })
             .await?;
         tracing::info!(steps = chain.len(), head = %head, "recorded openai run");
@@ -499,7 +563,7 @@ mod tests {
             ],
             "stop_reason": "end_turn"
         });
-        record_anthropic(&storage, &request, &response)
+        record_anthropic(&storage, &request, &response, None)
             .await
             .unwrap();
         let runs = storage.list_runs().await.unwrap();
@@ -526,7 +590,9 @@ mod tests {
             "content": [{"type": "text", "text": "5"}],
             "stop_reason": "end_turn"
         });
-        record_anthropic(&storage, &req1, &resp1).await.unwrap();
+        record_anthropic(&storage, &req1, &resp1, None)
+            .await
+            .unwrap();
 
         // Second call includes the prefix + a follow-up.
         let req2 = json!({
@@ -541,7 +607,9 @@ mod tests {
             "content": [{"type": "text", "text": "10"}],
             "stop_reason": "end_turn"
         });
-        record_anthropic(&storage, &req2, &resp2).await.unwrap();
+        record_anthropic(&storage, &req2, &resp2, None)
+            .await
+            .unwrap();
 
         let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 2, "two heads, one per call");
@@ -587,8 +655,12 @@ mod tests {
             "content": [{"type": "text", "text": "15"}], "stop_reason": "end_turn"
         });
 
-        record_anthropic(&storage, &req1, &resp1).await.unwrap();
-        record_anthropic(&storage, &req2, &resp2).await.unwrap();
+        record_anthropic(&storage, &req1, &resp1, None)
+            .await
+            .unwrap();
+        record_anthropic(&storage, &req2, &resp2, None)
+            .await
+            .unwrap();
 
         let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 2, "two heads, one per branch");
@@ -612,12 +684,12 @@ mod tests {
         let req = json!({"model": "m", "messages": [{"role":"user","content":"hi"}]});
         let resp = json!({"content":[{"type":"text","text":"hi back"}], "stop_reason":"end_turn"});
 
-        record_anthropic(&storage, &req, &resp).await.unwrap();
+        record_anthropic(&storage, &req, &resp, None).await.unwrap();
         let runs1 = storage.list_runs().await.unwrap();
         assert_eq!(runs1.len(), 1);
         let chain1 = storage.chain_to(&runs1[0].head).await.unwrap();
 
-        record_anthropic(&storage, &req, &resp).await.unwrap();
+        record_anthropic(&storage, &req, &resp, None).await.unwrap();
         let runs2 = storage.list_runs().await.unwrap();
         assert_eq!(runs2.len(), 1, "replay should not create a new run");
         assert_eq!(runs2[0].head, runs1[0].head);
@@ -643,7 +715,9 @@ mod tests {
             ],
             "stop_reason": "tool_use"
         });
-        record_anthropic(&storage, &req1, &resp1).await.unwrap();
+        record_anthropic(&storage, &req1, &resp1, None)
+            .await
+            .unwrap();
 
         // Second request: client sends tool_result, model replies.
         let req2 = json!({
@@ -664,7 +738,9 @@ mod tests {
             "content": [{"type": "text", "text": "The answer is 56."}],
             "stop_reason": "end_turn"
         });
-        record_anthropic(&storage, &req2, &resp2).await.unwrap();
+        record_anthropic(&storage, &req2, &resp2, None)
+            .await
+            .unwrap();
 
         let runs = storage.list_runs().await.unwrap();
         // Different heads — the second call extends the first.
@@ -706,7 +782,9 @@ mod tests {
                 "finish_reason": "tool_calls"
             }]
         });
-        record_openai(&storage, &request, &response).await.unwrap();
+        record_openai(&storage, &request, &response, None)
+            .await
+            .unwrap();
         let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 1);
         let chain = storage.chain_to(&runs[0].head).await.unwrap();

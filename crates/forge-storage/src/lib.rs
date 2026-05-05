@@ -28,6 +28,11 @@ pub struct RunMeta {
     pub head: NodeHash,
     pub root: NodeHash,
     pub recorded_at_ms: u64,
+    /// Optional free-form label, set via `x-forge-tag` header on the
+    /// recorder or `--tag` on `forge run`. Useful for filtering runs by
+    /// experiment / dataset / user.
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 #[async_trait]

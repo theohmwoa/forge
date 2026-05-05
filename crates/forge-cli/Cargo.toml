@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 crossterm = { workspace = true }
 forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }

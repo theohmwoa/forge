@@ -26,6 +26,19 @@ use sqlx::Row;
 
 use crate::{RunMeta, Storage};
 
+fn row_to_run_meta(r: sqlx::postgres::PgRow) -> RunMeta {
+    let head: String = r.get("head");
+    let root: String = r.get("root");
+    let recorded_at_ms: i64 = r.get("recorded_at_ms");
+    let tag: Option<String> = r.try_get("tag").ok().flatten();
+    RunMeta {
+        head: NodeHash(head),
+        root: NodeHash(root),
+        recorded_at_ms: recorded_at_ms as u64,
+        tag,
+    }
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS forge_steps (
     id           TEXT PRIMARY KEY,
@@ -37,8 +50,11 @@ CREATE INDEX IF NOT EXISTS forge_steps_parent_idx ON forge_steps(parent);
 CREATE TABLE IF NOT EXISTS forge_runs (
     head           TEXT PRIMARY KEY,
     root           TEXT NOT NULL,
-    recorded_at_ms BIGINT NOT NULL
+    recorded_at_ms BIGINT NOT NULL,
+    tag            TEXT
 );
+ALTER TABLE forge_runs ADD COLUMN IF NOT EXISTS tag TEXT;
+CREATE INDEX IF NOT EXISTS forge_runs_tag_idx ON forge_runs(tag);
 ";
 
 pub struct PostgresStorage {
@@ -114,57 +130,39 @@ impl Storage for PostgresStorage {
 
     async fn record_run(&self, meta: &RunMeta) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO forge_runs (head, root, recorded_at_ms)
-             VALUES ($1, $2, $3)
+            "INSERT INTO forge_runs (head, root, recorded_at_ms, tag)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (head) DO UPDATE
                  SET root = EXCLUDED.root,
-                     recorded_at_ms = EXCLUDED.recorded_at_ms",
+                     recorded_at_ms = EXCLUDED.recorded_at_ms,
+                     tag = COALESCE(EXCLUDED.tag, forge_runs.tag)",
         )
         .bind(&meta.head.0)
         .bind(&meta.root.0)
         .bind(meta.recorded_at_ms as i64)
+        .bind(meta.tag.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     async fn run_meta(&self, head: &NodeHash) -> anyhow::Result<Option<RunMeta>> {
-        let row = sqlx::query("SELECT head, root, recorded_at_ms FROM forge_runs WHERE head = $1")
-            .bind(&head.0)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| {
-            let head: String = r.get("head");
-            let root: String = r.get("root");
-            let recorded_at_ms: i64 = r.get("recorded_at_ms");
-            RunMeta {
-                head: NodeHash(head),
-                root: NodeHash(root),
-                recorded_at_ms: recorded_at_ms as u64,
-            }
-        }))
+        let row =
+            sqlx::query("SELECT head, root, recorded_at_ms, tag FROM forge_runs WHERE head = $1")
+                .bind(&head.0)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(row_to_run_meta))
     }
 
     async fn list_runs(&self) -> anyhow::Result<Vec<RunMeta>> {
         let rows = sqlx::query(
-            "SELECT head, root, recorded_at_ms FROM forge_runs
+            "SELECT head, root, recorded_at_ms, tag FROM forge_runs
              ORDER BY recorded_at_ms DESC",
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let head: String = r.get("head");
-                let root: String = r.get("root");
-                let recorded_at_ms: i64 = r.get("recorded_at_ms");
-                RunMeta {
-                    head: NodeHash(head),
-                    root: NodeHash(root),
-                    recorded_at_ms: recorded_at_ms as u64,
-                }
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_run_meta).collect())
     }
 
     /// Override the default chain walk with a single recursive CTE so we

@@ -22,9 +22,11 @@ trap "kill $PID 2>/dev/null || true" EXIT
 sleep 0.5
 
 echo "==> POST to http://127.0.0.1:$PORT/v1/messages (proxying to Anthropic)"
+echo "    tagging the run with x-forge-tag: my-experiment"
 curl -sS -X POST "http://127.0.0.1:$PORT/v1/messages" \
     -H "x-api-key: $ANTHROPIC_API_KEY" \
     -H "anthropic-version: 2023-06-01" \
+    -H "x-forge-tag: my-experiment" \
     -H "content-type: application/json" \
     -d '{
         "model": "claude-haiku-4-5-20251001",
@@ -34,8 +36,8 @@ curl -sS -X POST "http://127.0.0.1:$PORT/v1/messages" \
 echo
 echo
 
-echo "==> forge runs (one new entry should appear)"
-"$FORGE" --db "$DB" runs
+echo "==> forge runs --tag my-experiment"
+"$FORGE" --db "$DB" runs --tag my-experiment
 
 HEAD=$("$FORGE" --db "$DB" runs | awk '{print $1}' | head -1)
 echo

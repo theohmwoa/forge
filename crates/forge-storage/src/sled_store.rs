@@ -77,7 +77,23 @@ impl Storage for SledStorage {
     }
 
     async fn record_run(&self, meta: &RunMeta) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(meta)?;
+        // If the new meta has no tag and a previous record at this head did,
+        // preserve the existing tag (matches Postgres COALESCE semantics).
+        let merged = if meta.tag.is_none() {
+            match self.runs.get(meta.head.0.as_bytes())? {
+                Some(b) => {
+                    let existing: RunMeta = serde_json::from_slice(&b).unwrap_or(meta.clone());
+                    RunMeta {
+                        tag: existing.tag,
+                        ..meta.clone()
+                    }
+                }
+                None => meta.clone(),
+            }
+        } else {
+            meta.clone()
+        };
+        let bytes = serde_json::to_vec(&merged)?;
         self.runs.insert(meta.head.0.as_bytes(), bytes)?;
         Ok(())
     }

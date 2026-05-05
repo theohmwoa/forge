@@ -59,11 +59,17 @@ enum Cmd {
         /// Stream text deltas to stderr as they arrive (Anthropic only).
         #[arg(long, default_value_t = false)]
         stream: bool,
+        /// Free-form tag to attach to this run for later filtering.
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay { head: String },
-    /// List recorded runs.
-    Runs,
+    /// List recorded runs (optionally filtered by tag).
+    Runs {
+        #[arg(long)]
+        tag: Option<String>,
+    },
     /// Continue an existing run with an agent (potentially a different
     /// model). Records a new run head whose root matches the original.
     Continue {
@@ -249,6 +255,7 @@ async fn run() -> anyhow::Result<()> {
             tools,
             max_turns,
             stream,
+            tag,
         } => {
             let tool_set = build_tools(&tools);
             let mut agent = build_fresh_agent(agent, prompt, model, tool_set, max_turns, stream)?;
@@ -263,6 +270,7 @@ async fn run() -> anyhow::Result<()> {
                     head: head.clone(),
                     root,
                     recorded_at_ms: now_ms(),
+                    tag,
                 })
                 .await?;
 
@@ -280,17 +288,26 @@ async fn run() -> anyhow::Result<()> {
             println!("--- dag ---");
             print_chain(&*storage, &chain).await?;
         }
-        Cmd::Runs => {
-            let runs = storage.list_runs().await?;
+        Cmd::Runs { tag } => {
+            let mut runs = storage.list_runs().await?;
+            if let Some(t) = tag.as_deref() {
+                runs.retain(|r| r.tag.as_deref() == Some(t));
+            }
             if runs.is_empty() {
                 println!("no recorded runs in {}", cli.db);
             } else {
                 for r in runs {
+                    let tag_marker = r
+                        .tag
+                        .as_ref()
+                        .map(|t| format!("  tag={t}"))
+                        .unwrap_or_default();
                     println!(
-                        "{}  recorded_at={}  root={}",
+                        "{}  recorded_at={}  root={}{}",
                         short(&r.head.0),
                         r.recorded_at_ms,
                         short(&r.root.0),
+                        tag_marker,
                     );
                 }
             }
@@ -322,6 +339,7 @@ async fn run() -> anyhow::Result<()> {
                     head: new_head.clone(),
                     root,
                     recorded_at_ms: now_ms(),
+                    tag: None,
                 })
                 .await?;
             let mut full_chain = prefix_steps
@@ -387,6 +405,7 @@ async fn run() -> anyhow::Result<()> {
                     head: new_head.clone(),
                     root,
                     recorded_at_ms: now_ms(),
+                    tag: None,
                 })
                 .await?;
             println!("forked from {} at step {}", short(&head.0), at);

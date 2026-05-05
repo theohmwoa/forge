@@ -12,6 +12,7 @@ axum = { workspace = true }
 bytes = "1"
 forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }
+forge-openai = { path = "../forge-openai" }
 forge-storage = { path = "../forge-storage" }
 futures-util = { workspace = true }
 reqwest = { workspace = true }

@@ -71,6 +71,17 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [ ] Postgres backend (durable resume across machines, large blob dedup)
 - [ ] TUI viewer (`ratatui`)
 
+## Install
+
+```bash
+git clone https://github.com/theohmwoa/forge && cd forge
+cargo install --path crates/forge-cli --force
+forge --help
+```
+
+The binary lands in `~/.cargo/bin/forge`. Make sure that's in your `PATH`.
+Single binary, no runtime deps.
+
 ## Quick start
 
 ```bash
