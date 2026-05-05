@@ -1,0 +1,13 @@
+[package]
+name = "forge-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage backends for Forge agent run graphs."
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+forge-core = { path = "../forge-core" }
+tokio = { workspace = true }
