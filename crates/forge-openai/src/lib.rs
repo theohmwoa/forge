@@ -46,6 +46,7 @@ pub struct OpenAIAgent {
     user_prompt: Option<String>,
     initial_history: Vec<Value>,
     max_turns: usize,
+    stream: bool,
 }
 
 impl OpenAIAgent {
@@ -64,6 +65,7 @@ impl OpenAIAgent {
             user_prompt: Some(user_prompt),
             initial_history,
             max_turns: DEFAULT_MAX_TURNS,
+            stream: false,
         }
     }
 
@@ -78,6 +80,7 @@ impl OpenAIAgent {
             user_prompt: None,
             initial_history,
             max_turns: DEFAULT_MAX_TURNS,
+            stream: false,
         }
     }
 
@@ -88,6 +91,13 @@ impl OpenAIAgent {
 
     pub fn with_max_turns(mut self, n: usize) -> Self {
         self.max_turns = n.max(1);
+        self
+    }
+
+    /// Enable SSE streaming. Text deltas are printed to stderr in real time
+    /// during a turn; the graph still gets atomic Step entries.
+    pub fn with_streaming(mut self, on: bool) -> Self {
+        self.stream = on;
         self
     }
 
@@ -119,7 +129,11 @@ impl OpenAIAgent {
 
         for turn in 0..self.max_turns {
             tracing::debug!(turn, model = %self.config.model, "openai turn");
-            let response = self.call_api(&history).await?;
+            let response = if self.stream {
+                self.call_api_stream(&history).await?
+            } else {
+                self.call_api(&history).await?
+            };
             let choice = response["choices"][0].clone();
             let message = choice["message"].clone();
             let finish_reason = choice["finish_reason"].as_str().unwrap_or("").to_string();
@@ -220,6 +234,129 @@ impl OpenAIAgent {
             anyhow::bail!("openai api error ({status}): {body}");
         }
         Ok(body)
+    }
+
+    /// SSE streaming variant. Reduces the streamed `chat.completion.chunk`
+    /// events back to the same `{choices: [...]}` shape as a non-streaming
+    /// response so the caller can stay shape-agnostic. Text deltas are
+    /// printed to stderr in real time.
+    async fn call_api_stream(&self, history: &[Value]) -> anyhow::Result<Value> {
+        use futures_util::StreamExt;
+        use std::io::Write;
+
+        let mut req = json!({
+            "model": self.config.model,
+            "max_tokens": self.config.max_tokens,
+            "messages": history,
+            "stream": true,
+        });
+        let schemas = self.tool_schemas();
+        if !schemas.is_empty() {
+            req["tools"] = json!(schemas);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY contained invalid characters"))?,
+        );
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.insert("accept", HeaderValue::from_static("text/event-stream"));
+
+        let resp = self
+            .client
+            .post(API_URL)
+            .headers(headers)
+            .json(&req)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            anyhow::bail!("openai api error ({status}): {body}");
+        }
+
+        // Accumulator for the assembled message.
+        let mut content = String::new();
+        let mut finish_reason = String::new();
+        // tool_calls indexed by their `index` field, since deltas can fragment
+        // the arguments string and only the first delta carries id/name.
+        let mut tool_calls: Vec<Value> = Vec::new();
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(idx) = buffer.find("\n\n") {
+                let event_block: String = buffer.drain(..idx + 2).collect();
+                let data: String = event_block
+                    .lines()
+                    .filter(|l| l.starts_with("data:"))
+                    .map(|l| l.trim_start_matches("data:").trim())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let event: Value = match serde_json::from_str(&data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let delta = &event["choices"][0]["delta"];
+                if let Some(text) = delta["content"].as_str() {
+                    content.push_str(text);
+                    eprint!("{text}");
+                    let _ = std::io::stderr().flush();
+                }
+                if let Some(deltas) = delta["tool_calls"].as_array() {
+                    for d in deltas {
+                        let idx = d["index"].as_u64().unwrap_or(0) as usize;
+                        while tool_calls.len() <= idx {
+                            tool_calls.push(json!({
+                                "id": "",
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            }));
+                        }
+                        if let Some(id) = d["id"].as_str() {
+                            tool_calls[idx]["id"] = json!(id);
+                        }
+                        if let Some(name) = d["function"]["name"].as_str() {
+                            tool_calls[idx]["function"]["name"] = json!(name);
+                        }
+                        if let Some(args) = d["function"]["arguments"].as_str() {
+                            let existing = tool_calls[idx]["function"]["arguments"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string();
+                            tool_calls[idx]["function"]["arguments"] =
+                                json!(format!("{existing}{args}"));
+                        }
+                    }
+                }
+                if let Some(fr) = event["choices"][0]["finish_reason"].as_str() {
+                    finish_reason = fr.to_string();
+                }
+            }
+        }
+        let _ = writeln!(std::io::stderr());
+        let _ = std::io::stderr().flush();
+
+        let mut message = json!({ "role": "assistant", "content": content });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = json!(tool_calls);
+            message["content"] = Value::Null;
+        }
+        Ok(json!({
+            "choices": [{
+                "message": message,
+                "finish_reason": finish_reason,
+            }]
+        }))
     }
 }
 

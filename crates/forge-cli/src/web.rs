@@ -15,14 +15,14 @@ use axum::{
 };
 use forge::diff_chains;
 use forge_core::NodeHash;
-use forge_storage::SledStorage;
+use forge_storage::Storage;
 use serde_json::{json, Value};
 
 const INDEX_HTML: &str = include_str!("./web.html");
 
 #[derive(Clone)]
 pub struct WebState {
-    pub storage: Arc<SledStorage>,
+    pub storage: Arc<dyn Storage>,
 }
 
 pub fn router(state: WebState) -> Router {
@@ -39,7 +39,7 @@ async fn index() -> Html<&'static str> {
 }
 
 async fn list_runs(State(s): State<WebState>) -> Result<Json<Value>, ApiError> {
-    let runs = s.storage.list_runs()?;
+    let runs = s.storage.list_runs().await?;
     Ok(Json(json!({ "runs": runs })))
 }
 
@@ -48,7 +48,7 @@ async fn run_chain(
     Path(head): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let head_hash = NodeHash(head);
-    let chain = s.storage.chain_to(&head_hash)?;
+    let chain = s.storage.chain_to(&head_hash).await?;
     Ok(Json(json!({ "chain": chain })))
 }
 
@@ -56,8 +56,8 @@ async fn diff(
     State(s): State<WebState>,
     Path((a, b)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let chain_a = s.storage.chain_to(&NodeHash(a))?;
-    let chain_b = s.storage.chain_to(&NodeHash(b))?;
+    let chain_a = s.storage.chain_to(&NodeHash(a)).await?;
+    let chain_b = s.storage.chain_to(&NodeHash(b)).await?;
     let result = diff_chains(&chain_a, &chain_b);
     let aligned: Vec<Value> = result
         .aligned

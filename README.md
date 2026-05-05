@@ -61,6 +61,8 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Auto-threading via content-addressed prefix detection
 - [x] `forge web` embedded HTML viewer (single binary, no build pipeline)
 - [x] `examples/` with runnable scripts
+- [x] Postgres backend (`--db postgres://...`) for multi-process / multi-machine
+- [x] OpenAI SSE streaming (matches Anthropic; `--stream` works on both)
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"

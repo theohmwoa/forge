@@ -20,7 +20,7 @@ use axum::{
     Json, Router,
 };
 use forge_core::{NodeHash, Step, StepKind};
-use forge_storage::{RunMeta, SledStorage, Storage};
+use forge_storage::{RunMeta, Storage};
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 
@@ -28,7 +28,7 @@ const ANTHROPIC_UPSTREAM: &str = "https://api.anthropic.com/v1/messages";
 const OPENAI_UPSTREAM: &str = "https://api.openai.com/v1/chat/completions";
 
 pub struct RecorderState {
-    pub storage: Arc<SledStorage>,
+    pub storage: Arc<dyn Storage>,
     pub client: reqwest::Client,
 }
 
@@ -99,7 +99,7 @@ async fn proxy_anthropic(
             let raw = String::from_utf8_lossy(&bytes).to_string();
             let response_body = forge_anthropic::parse_anthropic_sse_body(&raw);
             if let Err(err) =
-                record_anthropic(&storage, &request_for_finalize, &response_body).await
+                record_anthropic(&*storage, &request_for_finalize, &response_body).await
             {
                 tracing::warn!(?err, "failed to record streamed anthropic run");
             }
@@ -120,7 +120,7 @@ async fn proxy_anthropic(
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
 
-    if let Err(err) = record_anthropic(&state.storage, &body, &response_body).await {
+    if let Err(err) = record_anthropic(&*state.storage, &body, &response_body).await {
         tracing::warn!(?err, "failed to record anthropic round-trip");
     }
     Ok(Json(response_body).into_response())
@@ -164,7 +164,7 @@ async fn proxy_openai(
         ));
     }
 
-    if let Err(err) = record_openai(&state.storage, &body, &response_body).await {
+    if let Err(err) = record_openai(&*state.storage, &body, &response_body).await {
         tracing::warn!(?err, "failed to record openai round-trip");
     }
     Ok(Json(response_body))
@@ -178,7 +178,7 @@ async fn proxy_openai(
 /// the run's head, which naturally extends previous heads of the same
 /// conversation.
 async fn record_anthropic(
-    storage: &SledStorage,
+    storage: &dyn Storage,
     request: &Value,
     response: &Value,
 ) -> anyhow::Result<()> {
@@ -230,11 +230,13 @@ async fn record_anthropic(
     }
 
     if let (Some(head), Some(root)) = (chain.last(), chain.first()) {
-        storage.record_run(&RunMeta {
-            head: head.clone(),
-            root: root.clone(),
-            recorded_at_ms: now,
-        })?;
+        storage
+            .record_run(&RunMeta {
+                head: head.clone(),
+                root: root.clone(),
+                recorded_at_ms: now,
+            })
+            .await?;
         tracing::info!(
             steps = chain.len(),
             head = %head,
@@ -318,7 +320,7 @@ fn anthropic_block_to_step(block: &Value) -> Option<StepKind> {
 }
 
 async fn record_openai(
-    storage: &SledStorage,
+    storage: &dyn Storage,
     request: &Value,
     response: &Value,
 ) -> anyhow::Result<()> {
@@ -392,11 +394,13 @@ async fn record_openai(
     }
 
     if let (Some(head), Some(root)) = (chain.last(), chain.first()) {
-        storage.record_run(&RunMeta {
-            head: head.clone(),
-            root: root.clone(),
-            recorded_at_ms: now,
-        })?;
+        storage
+            .record_run(&RunMeta {
+                head: head.clone(),
+                root: root.clone(),
+                recorded_at_ms: now,
+            })
+            .await?;
         tracing::info!(steps = chain.len(), head = %head, "recorded openai run");
     }
     Ok(())
@@ -476,6 +480,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_storage::SledStorage;
     use serde_json::json;
 
     #[tokio::test]
@@ -497,9 +502,9 @@ mod tests {
         record_anthropic(&storage, &request, &response)
             .await
             .unwrap();
-        let runs = storage.list_runs().unwrap();
+        let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 1);
-        let chain = storage.chain_to(&runs[0].head).unwrap();
+        let chain = storage.chain_to(&runs[0].head).await.unwrap();
         assert_eq!(chain.len(), 2);
         assert!(matches!(chain[0].kind, StepKind::Prompt { .. }));
         assert!(matches!(chain[1].kind, StepKind::Message { ref role, .. } if role == "assistant"));
@@ -538,13 +543,13 @@ mod tests {
         });
         record_anthropic(&storage, &req2, &resp2).await.unwrap();
 
-        let runs = storage.list_runs().unwrap();
+        let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 2, "two heads, one per call");
 
         // Order-independent: pick the shorter chain as the prefix and assert
         // it lines up with the longer chain step-for-step.
-        let a = storage.chain_to(&runs[0].head).unwrap();
-        let b = storage.chain_to(&runs[1].head).unwrap();
+        let a = storage.chain_to(&runs[0].head).await.unwrap();
+        let b = storage.chain_to(&runs[1].head).await.unwrap();
         let (short, long) = if a.len() < b.len() { (a, b) } else { (b, a) };
         for i in 0..short.len() {
             assert_eq!(short[i].id, long[i].id, "step {i} should be shared");
@@ -585,10 +590,10 @@ mod tests {
         record_anthropic(&storage, &req1, &resp1).await.unwrap();
         record_anthropic(&storage, &req2, &resp2).await.unwrap();
 
-        let runs = storage.list_runs().unwrap();
+        let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 2, "two heads, one per branch");
-        let c1 = storage.chain_to(&runs[0].head).unwrap();
-        let c2 = storage.chain_to(&runs[1].head).unwrap();
+        let c1 = storage.chain_to(&runs[0].head).await.unwrap();
+        let c2 = storage.chain_to(&runs[1].head).await.unwrap();
         assert_eq!(c1[0].id, c2[0].id, "prompt is shared");
         assert_eq!(c1[1].id, c2[1].id, "first assistant message is shared");
         assert_ne!(c1[2].id, c2[2].id, "follow-up diverges");
@@ -608,15 +613,15 @@ mod tests {
         let resp = json!({"content":[{"type":"text","text":"hi back"}], "stop_reason":"end_turn"});
 
         record_anthropic(&storage, &req, &resp).await.unwrap();
-        let runs1 = storage.list_runs().unwrap();
+        let runs1 = storage.list_runs().await.unwrap();
         assert_eq!(runs1.len(), 1);
-        let chain1 = storage.chain_to(&runs1[0].head).unwrap();
+        let chain1 = storage.chain_to(&runs1[0].head).await.unwrap();
 
         record_anthropic(&storage, &req, &resp).await.unwrap();
-        let runs2 = storage.list_runs().unwrap();
+        let runs2 = storage.list_runs().await.unwrap();
         assert_eq!(runs2.len(), 1, "replay should not create a new run");
         assert_eq!(runs2[0].head, runs1[0].head);
-        let chain2 = storage.chain_to(&runs2[0].head).unwrap();
+        let chain2 = storage.chain_to(&runs2[0].head).await.unwrap();
         assert_eq!(chain2.len(), chain1.len());
     }
 
@@ -661,12 +666,12 @@ mod tests {
         });
         record_anthropic(&storage, &req2, &resp2).await.unwrap();
 
-        let runs = storage.list_runs().unwrap();
+        let runs = storage.list_runs().await.unwrap();
         // Different heads — the second call extends the first.
-        let chains: Vec<_> = runs
-            .iter()
-            .map(|r| storage.chain_to(&r.head).unwrap())
-            .collect();
+        let mut chains: Vec<Vec<Step>> = Vec::new();
+        for r in &runs {
+            chains.push(storage.chain_to(&r.head).await.unwrap());
+        }
         let longest = chains.iter().max_by_key(|c| c.len()).unwrap();
         // prompt + assistant message + tool_call + tool_result + final message
         assert_eq!(longest.len(), 5);
@@ -702,9 +707,9 @@ mod tests {
             }]
         });
         record_openai(&storage, &request, &response).await.unwrap();
-        let runs = storage.list_runs().unwrap();
+        let runs = storage.list_runs().await.unwrap();
         assert_eq!(runs.len(), 1);
-        let chain = storage.chain_to(&runs[0].head).unwrap();
+        let chain = storage.chain_to(&runs[0].head).await.unwrap();
         // prompt + assistant message + tool_call
         assert_eq!(chain.len(), 3);
         assert!(matches!(chain[2].kind, StepKind::ToolCall { .. }));

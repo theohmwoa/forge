@@ -1,31 +1,23 @@
-//! Sled-backed `Storage`. Single-process, persistent, good enough for v0.0.2.
+//! Sled-backed `Storage`. Single-process, persistent.
 //!
 //! Layout:
 //! - `steps`     : `hash` -> JSON-encoded `Step`
 //! - `children`  : `hash` -> JSON-encoded `Vec<NodeHash>`
-//! - `runs`      : `head_hash` -> JSON-encoded `RunMeta` (recorded run heads)
+//! - `runs`      : `head_hash` -> JSON-encoded `RunMeta`
 //!
-//! Concurrency note: read-modify-write of the children index is not safe under
-//! multi-process writers. Single-process is fine for now; revisit when we add
-//! the Postgres backend.
+//! Concurrency note: read-modify-write of the children index is not safe
+//! under multi-process writers. Use `PostgresStorage` for that.
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use forge_core::{NodeHash, Step};
-use serde::{Deserialize, Serialize};
 
-use crate::Storage;
+use crate::{RunMeta, Storage};
 
 const TREE_STEPS: &str = "steps";
 const TREE_CHILDREN: &str = "children";
 const TREE_RUNS: &str = "runs";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunMeta {
-    pub head: NodeHash,
-    pub root: NodeHash,
-    pub recorded_at_ms: u64,
-}
 
 pub struct SledStorage {
     _db: sled::Db,
@@ -47,49 +39,9 @@ impl SledStorage {
             runs,
         })
     }
-
-    pub fn record_run(&self, meta: &RunMeta) -> anyhow::Result<()> {
-        let bytes = serde_json::to_vec(meta)?;
-        self.runs.insert(meta.head.0.as_bytes(), bytes)?;
-        Ok(())
-    }
-
-    pub fn run_meta(&self, head: &NodeHash) -> anyhow::Result<Option<RunMeta>> {
-        match self.runs.get(head.0.as_bytes())? {
-            Some(b) => Ok(Some(serde_json::from_slice(&b)?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn list_runs(&self) -> anyhow::Result<Vec<RunMeta>> {
-        let mut out = Vec::new();
-        for kv in self.runs.iter() {
-            let (_, v) = kv?;
-            out.push(serde_json::from_slice::<RunMeta>(&v)?);
-        }
-        out.sort_by_key(|m| std::cmp::Reverse(m.recorded_at_ms));
-        Ok(out)
-    }
-
-    /// Walk a chain backward from `head`, returning steps in root-to-head order.
-    pub fn chain_to(&self, head: &NodeHash) -> anyhow::Result<Vec<Step>> {
-        let mut out = Vec::new();
-        let mut cursor = Some(head.clone());
-        while let Some(h) = cursor {
-            let bytes = self
-                .steps
-                .get(h.0.as_bytes())?
-                .ok_or_else(|| anyhow::anyhow!("step missing while walking chain: {h}"))?;
-            let step: Step = serde_json::from_slice(&bytes)?;
-            cursor = step.parent.clone();
-            out.push(step);
-        }
-        out.reverse();
-        Ok(out)
-    }
 }
 
-#[async_trait::async_trait]
+#[async_trait]
 impl Storage for SledStorage {
     async fn put(&self, step: Step) -> anyhow::Result<NodeHash> {
         let hash = step.id.clone();
@@ -123,16 +75,35 @@ impl Storage for SledStorage {
             None => Ok(Vec::new()),
         }
     }
+
+    async fn record_run(&self, meta: &RunMeta) -> anyhow::Result<()> {
+        let bytes = serde_json::to_vec(meta)?;
+        self.runs.insert(meta.head.0.as_bytes(), bytes)?;
+        Ok(())
+    }
+
+    async fn run_meta(&self, head: &NodeHash) -> anyhow::Result<Option<RunMeta>> {
+        match self.runs.get(head.0.as_bytes())? {
+            Some(b) => Ok(Some(serde_json::from_slice(&b)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_runs(&self) -> anyhow::Result<Vec<RunMeta>> {
+        let mut out = Vec::new();
+        for kv in self.runs.iter() {
+            let (_, v) = kv?;
+            out.push(serde_json::from_slice::<RunMeta>(&v)?);
+        }
+        out.sort_by_key(|m| std::cmp::Reverse(m.recorded_at_ms));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use forge_core::StepKind;
-
-    fn ms(n: u64) -> u64 {
-        n
-    }
 
     #[tokio::test]
     async fn round_trips_a_chain() {
@@ -145,7 +116,7 @@ mod tests {
                 role: "user".into(),
                 content: "hi".into(),
             },
-            ms(1),
+            1,
         );
         let s1 = Step::new(
             Some(s0.id.clone()),
@@ -153,7 +124,7 @@ mod tests {
                 role: "assistant".into(),
                 content: "hello".into(),
             },
-            ms(2),
+            2,
         );
 
         store.put(s0.clone()).await.unwrap();
@@ -165,7 +136,7 @@ mod tests {
         let kids = store.children(&s0.id).await.unwrap();
         assert_eq!(kids, vec![s1.id.clone()]);
 
-        let chain = store.chain_to(&s1.id).unwrap();
+        let chain = store.chain_to(&s1.id).await.unwrap();
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].id, s0.id);
         assert_eq!(chain[1].id, s1.id);
