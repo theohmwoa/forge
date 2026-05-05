@@ -12,8 +12,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use forge_core::{NodeHash, Step};
+use tokio::sync::broadcast;
 
-use crate::{RunMeta, Storage};
+use crate::{RunMeta, Storage, RUN_BROADCAST_CAPACITY};
 
 const TREE_STEPS: &str = "steps";
 const TREE_CHILDREN: &str = "children";
@@ -24,6 +25,7 @@ pub struct SledStorage {
     steps: sled::Tree,
     children: sled::Tree,
     runs: sled::Tree,
+    run_tx: broadcast::Sender<RunMeta>,
 }
 
 impl SledStorage {
@@ -32,11 +34,13 @@ impl SledStorage {
         let steps = db.open_tree(TREE_STEPS)?;
         let children = db.open_tree(TREE_CHILDREN)?;
         let runs = db.open_tree(TREE_RUNS)?;
+        let (run_tx, _) = broadcast::channel(RUN_BROADCAST_CAPACITY);
         Ok(Self {
             _db: db,
             steps,
             children,
             runs,
+            run_tx,
         })
     }
 }
@@ -95,6 +99,7 @@ impl Storage for SledStorage {
         };
         let bytes = serde_json::to_vec(&merged)?;
         self.runs.insert(meta.head.0.as_bytes(), bytes)?;
+        let _ = self.run_tx.send(merged);
         Ok(())
     }
 
@@ -113,6 +118,10 @@ impl Storage for SledStorage {
         }
         out.sort_by_key(|m| std::cmp::Reverse(m.recorded_at_ms));
         Ok(out)
+    }
+
+    fn subscribe_runs(&self) -> broadcast::Receiver<RunMeta> {
+        self.run_tx.subscribe()
     }
 }
 

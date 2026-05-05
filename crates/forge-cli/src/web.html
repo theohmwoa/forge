@@ -136,6 +136,54 @@
     border-radius: 3px;
   }
   .diff-toggle button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .action-row {
+    display: flex;
+    gap: 8px;
+    margin: 0 0 12px 0;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .action-btn {
+    background: #222;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 5px 11px;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .action-btn:hover { background: #2a2a2a; }
+  .action-btn.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .panel {
+    margin-top: 14px;
+    padding: 12px 14px;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .panel textarea, .panel input, .panel select {
+    width: 100%;
+    background: #111;
+    border: 1px solid var(--border);
+    color: var(--fg);
+    font-family: inherit;
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 3px;
+    box-sizing: border-box;
+  }
+  .panel textarea { resize: vertical; min-height: 80px; }
+  .form-row {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 8px;
+    align-items: center;
+    margin: 6px 0;
+  }
+  .form-row label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .checkbox { display: flex; gap: 6px; align-items: center; color: var(--fg); text-transform: none; letter-spacing: 0; }
+  .muted { color: var(--muted); font-size: 11px; }
 </style>
 </head>
 <body>
@@ -351,13 +399,153 @@ function renderContent() {
     return;
   }
   const s = state.selectedStep;
+  const isLast = state.chain.length && state.chain[state.chain.length - 1].id === s.id;
   el.innerHTML = `
     <h2>${stepLabel(s)} · ${s.id}</h2>
-    <pre>${escapeHtml(stepBody(s))}</pre>`;
+    <div class="action-row">
+      <button class="action-btn" id="btn-fork">fork from this step…</button>
+      ${isLast ? '<button class="action-btn" id="btn-continue">continue this run…</button>' : ''}
+    </div>
+    <pre>${escapeHtml(stepBody(s))}</pre>
+    <div id="action-panel"></div>`;
+  document.getElementById('btn-fork').onclick = () => showForkPanel(s);
+  if (isLast) {
+    document.getElementById('btn-continue').onclick = () => showContinuePanel();
+  }
+}
+
+function showForkPanel(step) {
+  const panel = document.getElementById('action-panel');
+  const isJsonKind = step.kind.type === 'tool_call' || step.kind.type === 'tool_result';
+  const hint = isJsonKind ? 'JSON for tool_call/tool_result' : 'plain text';
+  panel.innerHTML = `
+    <div class="panel">
+      <h2>fork at ${stepLabel(step)} <span class="muted">(${hint})</span></h2>
+      <textarea id="fork-text" rows="8">${escapeHtml(stepBody(step))}</textarea>
+      <div class="action-row">
+        <button class="action-btn primary" id="fork-go">fork</button>
+        <button class="action-btn" id="fork-cancel">cancel</button>
+        <span id="fork-status" class="muted"></span>
+      </div>
+    </div>`;
+  document.getElementById('fork-cancel').onclick = () => { panel.innerHTML = ''; };
+  document.getElementById('fork-go').onclick = async () => {
+    const status = document.getElementById('fork-status');
+    status.textContent = 'forking…';
+    try {
+      const rewrite = document.getElementById('fork-text').value;
+      const r = await fetch(`/api/runs/${state.selectedRun}/fork`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({ at: step.id, rewrite }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      const { head } = await r.json();
+      status.textContent = `done · ${head.slice(0, 10)}`;
+      await loadRuns();
+      await loadRun(head);
+    } catch (e) {
+      status.textContent = 'error: ' + e.message;
+      status.style.color = 'var(--only-a)';
+    }
+  };
+}
+
+function showContinuePanel() {
+  const panel = document.getElementById('action-panel');
+  panel.innerHTML = `
+    <div class="panel">
+      <h2>continue this run with another model</h2>
+      <div class="form-row">
+        <label>agent</label>
+        <select id="cont-agent">
+          <option value="anthropic">anthropic</option>
+          <option value="openai">openai</option>
+          <option value="gemini">gemini</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>model</label>
+        <input id="cont-model" value="claude-sonnet-4-6" />
+      </div>
+      <div class="form-row">
+        <label>max turns</label>
+        <input id="cont-turns" type="number" min="1" />
+      </div>
+      <div class="form-row">
+        <label>tools</label>
+        <label class="checkbox"><input type="checkbox" id="cont-tool-calc"> calculator</label>
+      </div>
+      <div class="action-row">
+        <button class="action-btn primary" id="cont-go">continue</button>
+        <button class="action-btn" id="cont-cancel">cancel</button>
+        <span id="cont-status" class="muted"></span>
+      </div>
+    </div>`;
+  document.getElementById('cont-cancel').onclick = () => { panel.innerHTML = ''; };
+  document.getElementById('cont-go').onclick = async () => {
+    const status = document.getElementById('cont-status');
+    status.textContent = 'running…';
+    try {
+      const turns = document.getElementById('cont-turns').value;
+      const body = {
+        agent: document.getElementById('cont-agent').value,
+        model: document.getElementById('cont-model').value,
+        max_turns: turns ? parseInt(turns, 10) : null,
+        tools: document.getElementById('cont-tool-calc').checked ? ['calculator'] : [],
+      };
+      const r = await fetch(`/api/runs/${state.selectedRun}/continue`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText);
+      const { head, appended } = await r.json();
+      status.textContent = `done · +${appended} steps · ${head.slice(0, 10)}`;
+      await loadRuns();
+      await loadRun(head);
+    } catch (e) {
+      status.textContent = 'error: ' + e.message;
+      status.style.color = 'var(--only-a)';
+    }
+  };
 }
 
 loadRuns();
-setInterval(loadRuns, 5000);
+
+// Live updates via SSE — Postgres LISTEN/NOTIFY propagates writes from any
+// process; sled / memory backends fan in-process writes through the same
+// channel. Falls back to a slow poll if the stream errors out.
+function startEventStream() {
+  let pollHandle = null;
+  const startPoll = () => {
+    if (pollHandle) return;
+    pollHandle = setInterval(loadRuns, 5000);
+  };
+  const stopPoll = () => {
+    if (!pollHandle) return;
+    clearInterval(pollHandle);
+    pollHandle = null;
+  };
+
+  const es = new EventSource('/api/runs/stream');
+  es.addEventListener('run', (e) => {
+    try {
+      const meta = JSON.parse(e.data);
+      const exists = state.runs.find(r => r.head === meta.head);
+      if (exists) Object.assign(exists, meta);
+      else state.runs.unshift(meta);
+      state.runs.sort((a, b) => b.recorded_at_ms - a.recorded_at_ms);
+      renderRuns();
+    } catch (_) { /* ignore */ }
+  });
+  es.onerror = () => {
+    es.close();
+    startPoll();
+    setTimeout(() => { stopPoll(); startEventStream(); }, 5000);
+  };
+}
+startEventStream();
 </script>
 </body>
 </html>

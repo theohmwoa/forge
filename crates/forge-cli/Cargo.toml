@@ -25,7 +25,9 @@ forge-gemini = { path = "../forge-gemini" }
 forge-openai = { path = "../forge-openai" }
 forge-recorder = { path = "../forge-recorder" }
 forge-storage = { path = "../forge-storage" }
+futures-util = { workspace = true }
 ratatui = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 similar = { workspace = true }

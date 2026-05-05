@@ -158,6 +158,7 @@ impl AnthropicAgent {
             };
             let content = response["content"].as_array().cloned().unwrap_or_default();
             let stop_reason = response["stop_reason"].as_str().unwrap_or("").to_string();
+            log_usage(turn, &response["usage"]);
 
             let mut tool_results: Vec<Value> = Vec::new();
             for block in &content {
@@ -309,6 +310,7 @@ impl AnthropicAgent {
         let mut blocks: Vec<Value> = Vec::new();
         let mut partial_json: Vec<String> = Vec::new();
         let mut stop_reason = String::new();
+        let mut usage: Value = json!({});
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
@@ -330,6 +332,7 @@ impl AnthropicAgent {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                merge_usage_from_event(&mut usage, &event);
                 if let Some(delta) = handle_anthropic_sse_event(
                     &event,
                     &mut blocks,
@@ -361,7 +364,8 @@ impl AnthropicAgent {
 
         Ok(json!({
             "content": blocks,
-            "stop_reason": stop_reason
+            "stop_reason": stop_reason,
+            "usage": usage,
         }))
     }
 }
@@ -377,6 +381,54 @@ impl Agent for AnthropicAgent {
             }
         }
         self.pending.pop_front()
+    }
+}
+
+/// Log the per-turn token usage from an Anthropic response. Surfaces the
+/// `cache_creation_input_tokens` / `cache_read_input_tokens` fields so users
+/// can confirm prompt caching is actually saving them money. Skipped silently
+/// when the response shape doesn't include usage (e.g. an error path).
+fn log_usage(turn: usize, usage: &Value) {
+    if !usage.is_object() {
+        return;
+    }
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    let cache_create = usage["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+    let cache_read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
+    if input == 0 && output == 0 && cache_create == 0 && cache_read == 0 {
+        return;
+    }
+    tracing::info!(
+        turn,
+        input_tokens = input,
+        output_tokens = output,
+        cache_creation_input_tokens = cache_create,
+        cache_read_input_tokens = cache_read,
+        "anthropic usage"
+    );
+}
+
+/// Merge the `usage` payload from an SSE event into a running accumulator.
+/// `message_start.message.usage` carries the prompt-side counts (including
+/// cache reads/creates); `message_delta.usage` updates the output token
+/// count as the response streams in.
+fn merge_usage_from_event(acc: &mut Value, event: &Value) {
+    let etype = event["type"].as_str().unwrap_or("");
+    let src = match etype {
+        "message_start" => &event["message"]["usage"],
+        "message_delta" => &event["usage"],
+        _ => return,
+    };
+    let Some(obj) = src.as_object() else {
+        return;
+    };
+    if !acc.is_object() {
+        *acc = json!({});
+    }
+    let acc_obj = acc.as_object_mut().expect("just-created object");
+    for (k, v) in obj {
+        acc_obj.insert(k.clone(), v.clone());
     }
 }
 
@@ -429,6 +481,7 @@ pub fn parse_anthropic_sse_body(body: &str) -> serde_json::Value {
     let mut blocks: Vec<Value> = Vec::new();
     let mut partial_json: Vec<String> = Vec::new();
     let mut stop_reason = String::new();
+    let mut usage: Value = json!({});
 
     for chunk in body.split("\n\n") {
         let data: String = chunk
@@ -444,9 +497,10 @@ pub fn parse_anthropic_sse_body(body: &str) -> serde_json::Value {
             Ok(v) => v,
             Err(_) => continue,
         };
+        merge_usage_from_event(&mut usage, &event);
         handle_anthropic_sse_event(&event, &mut blocks, &mut partial_json, &mut stop_reason);
     }
-    json!({ "content": blocks, "stop_reason": stop_reason })
+    json!({ "content": blocks, "stop_reason": stop_reason, "usage": usage })
 }
 
 /// Apply one parsed SSE event to the in-progress block buffer.
@@ -630,6 +684,35 @@ mod tests {
         // First block left alone; last one is tagged.
         assert!(blocks[0].get("cache_control").is_none());
         assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn merge_usage_picks_up_message_start_and_message_delta() {
+        let mut acc = json!({});
+        merge_usage_from_event(
+            &mut acc,
+            &json!({
+                "type": "message_start",
+                "message": {"usage": {
+                    "input_tokens": 12,
+                    "cache_creation_input_tokens": 100,
+                    "cache_read_input_tokens": 50,
+                    "output_tokens": 1
+                }}
+            }),
+        );
+        merge_usage_from_event(
+            &mut acc,
+            &json!({
+                "type": "message_delta",
+                "usage": {"output_tokens": 42}
+            }),
+        );
+        assert_eq!(acc["input_tokens"], 12);
+        assert_eq!(acc["cache_creation_input_tokens"], 100);
+        assert_eq!(acc["cache_read_input_tokens"], 50);
+        // message_delta replaces the streaming output count.
+        assert_eq!(acc["output_tokens"], 42);
     }
 
     #[test]

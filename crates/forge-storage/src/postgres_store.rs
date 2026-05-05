@@ -21,10 +21,13 @@
 
 use async_trait::async_trait;
 use forge_core::{NodeHash, Step, StepKind};
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use sqlx::Row;
+use tokio::sync::broadcast;
 
-use crate::{RunMeta, Storage};
+use crate::{RunMeta, Storage, RUN_BROADCAST_CAPACITY};
+
+const NOTIFY_CHANNEL: &str = "forge_runs";
 
 fn row_to_run_meta(r: sqlx::postgres::PgRow) -> RunMeta {
     let head: String = r.get("head");
@@ -59,11 +62,17 @@ CREATE INDEX IF NOT EXISTS forge_runs_tag_idx ON forge_runs(tag);
 
 pub struct PostgresStorage {
     pool: PgPool,
+    run_tx: broadcast::Sender<RunMeta>,
 }
 
 impl PostgresStorage {
     /// Connect to a Postgres URL (`postgres://user:pass@host:port/db`) and
     /// run the (idempotent) schema migration.
+    ///
+    /// Also spawns a background task that `LISTEN`s on the `forge_runs`
+    /// channel. Any `NOTIFY` (issued by `record_run` on this or any other
+    /// process) is fanned out to local `subscribe_runs()` receivers — the
+    /// backbone of the live `forge web` viewer.
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
@@ -71,7 +80,54 @@ impl PostgresStorage {
             .await
             .map_err(|e| friendly_connect_error(url, e))?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
-        Ok(Self { pool })
+        let (run_tx, _) = broadcast::channel(RUN_BROADCAST_CAPACITY);
+        spawn_notify_listener(url.to_string(), run_tx.clone());
+        Ok(Self { pool, run_tx })
+    }
+}
+
+/// Background task: open a dedicated connection to LISTEN forge_runs and feed
+/// every notification (a JSON-serialized `RunMeta`) into the broadcast.
+///
+/// We open a fresh connection rather than borrowing from the pool because
+/// `PgListener` holds the connection for its lifetime; pulling from the pool
+/// would starve other queries.
+fn spawn_notify_listener(url: String, tx: broadcast::Sender<RunMeta>) {
+    tokio::spawn(async move {
+        loop {
+            match run_listener(&url, &tx).await {
+                Ok(()) => {
+                    tracing::debug!("postgres listener exited cleanly; reconnecting");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "postgres listener errored; reconnecting in 2s");
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+            // If nobody's subscribed (the receiver count is 0), drop out —
+            // the storage is unused. The next subscriber recreates us is not
+            // implemented, so leave the loop active until the process exits.
+            if tx.receiver_count() == 0 {
+                // Still loop; cheap when idle.
+            }
+        }
+    });
+}
+
+async fn run_listener(url: &str, tx: &broadcast::Sender<RunMeta>) -> anyhow::Result<()> {
+    let mut listener = PgListener::connect(url).await?;
+    listener.listen(NOTIFY_CHANNEL).await?;
+    loop {
+        let notif = listener.recv().await?;
+        let payload = notif.payload();
+        match serde_json::from_str::<RunMeta>(payload) {
+            Ok(meta) => {
+                let _ = tx.send(meta);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, payload, "ignoring malformed forge_runs payload");
+            }
+        }
     }
 }
 
@@ -192,6 +248,14 @@ impl Storage for PostgresStorage {
         .bind(meta.tag.as_deref())
         .execute(&self.pool)
         .await?;
+        // NOTIFY so other processes (and our own LISTEN task) see the run.
+        // Notification payloads are limited to ~8000 bytes; RunMeta is tiny.
+        let payload = serde_json::to_string(meta)?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(NOTIFY_CHANNEL)
+            .bind(&payload)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -212,6 +276,10 @@ impl Storage for PostgresStorage {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_run_meta).collect())
+    }
+
+    fn subscribe_runs(&self) -> broadcast::Receiver<RunMeta> {
+        self.run_tx.subscribe()
     }
 
     /// Override the default chain walk with a single recursive CTE so we

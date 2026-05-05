@@ -1,21 +1,16 @@
 [package]
-name = "forge-storage"
+name = "forge-rig"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Storage backends for Forge agent run graphs."
+description = "Forge: record a Rig conversation as a content-addressed step chain."
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 forge-core = { path = "../forge-core" }
-serde = { workspace = true }
+forge-storage = { path = "../forge-storage" }
+rig-core = "0.36"
 serde_json = { workspace = true }
-sled = { workspace = true }
-sqlx = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

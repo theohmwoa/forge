@@ -17,11 +17,16 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use forge_core::{NodeHash, Step};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 mod postgres_store;
 mod sled_store;
 pub use postgres_store::PostgresStorage;
 pub use sled_store::SledStorage;
+
+/// Channel capacity for the per-storage `RunMeta` broadcast. Lagged subscribers
+/// are dropped (the SSE handler reconnects).
+const RUN_BROADCAST_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunMeta {
@@ -45,6 +50,15 @@ pub trait Storage: Send + Sync {
     async fn run_meta(&self, head: &NodeHash) -> anyhow::Result<Option<RunMeta>>;
     async fn list_runs(&self) -> anyhow::Result<Vec<RunMeta>>;
 
+    /// Subscribe to a stream of newly-recorded runs. The default returns a
+    /// receiver from a closed channel — backends override to wire it into
+    /// `record_run` (and, for Postgres, into `LISTEN forge_runs`).
+    fn subscribe_runs(&self) -> broadcast::Receiver<RunMeta> {
+        let (tx, rx) = broadcast::channel(1);
+        drop(tx);
+        rx
+    }
+
     /// Walk parents from `head` and return the chain in root-to-head order.
     /// Default implementation uses `get`; backends may override with a
     /// single-query implementation (recursive CTE on Postgres, etc.).
@@ -64,16 +78,28 @@ pub trait Storage: Send + Sync {
     }
 }
 
-#[derive(Default)]
 pub struct MemoryStorage {
     steps: Mutex<HashMap<NodeHash, Step>>,
     children: Mutex<HashMap<NodeHash, Vec<NodeHash>>>,
     runs: Mutex<HashMap<NodeHash, RunMeta>>,
+    run_tx: broadcast::Sender<RunMeta>,
+}
+
+impl Default for MemoryStorage {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MemoryStorage {
     pub fn new() -> Self {
-        Self::default()
+        let (run_tx, _) = broadcast::channel(RUN_BROADCAST_CAPACITY);
+        Self {
+            steps: Mutex::new(HashMap::new()),
+            children: Mutex::new(HashMap::new()),
+            runs: Mutex::new(HashMap::new()),
+            run_tx,
+        }
     }
 }
 
@@ -111,6 +137,7 @@ impl Storage for MemoryStorage {
             .lock()
             .unwrap()
             .insert(meta.head.clone(), meta.clone());
+        let _ = self.run_tx.send(meta.clone());
         Ok(())
     }
 
@@ -122,5 +149,9 @@ impl Storage for MemoryStorage {
         let mut out: Vec<RunMeta> = self.runs.lock().unwrap().values().cloned().collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.recorded_at_ms));
         Ok(out)
+    }
+
+    fn subscribe_runs(&self) -> broadcast::Receiver<RunMeta> {
+        self.run_tx.subscribe()
     }
 }

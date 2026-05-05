@@ -32,6 +32,7 @@ Cargo workspace, three crates:
 | `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use, prompt caching) |
 | `forge-openai` | OpenAI Chat Completions adapter (multi-turn tool use) |
 | `forge-gemini` | Google Gemini `generateContent` adapter (multi-turn function calling) |
+| `forge-rig` | Record a [Rig](https://rig.rs) conversation as a Forge step chain |
 | `forge-cli` | the `forge` binary (`run`, `runs`, `replay`, `continue`, `fork`, `diff`) |
 
 Storage backends planned: in-memory (done), sled, Postgres (single source of truth, durable resume).
@@ -69,6 +70,10 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `forge web` token-level inline diff for modified steps
 - [x] Friendly Postgres connect errors (one-line messages for auth / DNS / refused)
 - [x] `--public` flag on `forge serve` and `forge web` to opt-in to non-localhost bind
+- [x] Live `forge web` updates via Postgres `LISTEN/NOTIFY` (broadcast for sled / memory)
+- [x] Web UI fork/continue actions (localhost-only until auth ships)
+- [x] Anthropic cache-hit telemetry (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+- [x] `forge-rig` crate to record a [Rig](https://rig.rs) conversation
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"

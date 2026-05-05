@@ -31,6 +31,7 @@ crates/
 ├── forge-gemini      # Google Gemini generateContent adapter
 ├── forge-openai      # OpenAI Chat Completions adapter
 ├── forge-recorder    # axum proxy: records LLM calls into Forge
+├── forge-rig         # Record a Rig conversation into the Forge graph
 └── forge-storage     # Storage trait + Memory / Sled / Postgres backends
 ```
 

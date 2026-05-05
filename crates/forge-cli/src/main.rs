@@ -526,7 +526,11 @@ async fn run() -> anyhow::Result<()> {
             println!("(shift-click two runs to diff them)");
             println!();
             println!("press ctrl-c to stop");
-            axum::serve(listener, app).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await?;
         }
     }
     Ok(())
