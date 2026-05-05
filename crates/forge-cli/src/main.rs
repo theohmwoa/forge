@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod tui;
+
 use forge::{
     auto_run_tool_after_fork, diff_chains, fork_chain, print_chain, render_diff, run_agent,
     run_agent_from,
@@ -89,6 +91,15 @@ enum Cmd {
     },
     /// Diff two recorded runs by walking their chains pairwise.
     Diff { a: String, b: String },
+    /// Open a TUI viewer for a single run, or pass `--diff` to view aligned
+    /// diff between two runs.
+    View {
+        /// Run head hash (or unique prefix). When `--diff` is set, this is run A.
+        run: String,
+        /// Run B for diff mode.
+        #[arg(long)]
+        diff: Option<String>,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -356,6 +367,20 @@ async fn run() -> anyhow::Result<()> {
             println!("B: {}  ({} steps)", short(&head_b.0), chain_b.len());
             print!("{}", render_diff(&result));
         }
+        Cmd::View { run, diff } => match diff {
+            None => {
+                let head = resolve_head(&storage, &run)?;
+                let steps = storage.chain_to(&head)?;
+                tui::view_run(steps, short(&head.0))?;
+            }
+            Some(b) => {
+                let head_a = resolve_head(&storage, &run)?;
+                let head_b = resolve_head(&storage, &b)?;
+                let chain_a = storage.chain_to(&head_a)?;
+                let chain_b = storage.chain_to(&head_b)?;
+                tui::view_diff(chain_a, chain_b, short(&head_a.0), short(&head_b.0))?;
+            }
+        },
     }
     Ok(())
 }

@@ -54,6 +54,7 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] OpenAI Chat Completions adapter (`--agent openai`)
 - [x] Cross-provider continuations: run with Claude, continue with GPT-5
 - [x] Friendly error rendering (no Rust backtrace on missing API key)
+- [x] `forge view` TUI: timeline + content panes, single-run and aligned-diff modes
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -98,6 +99,10 @@ forge continue <head> --model claude-sonnet-4-6 --tools calculator
 
 # diff two runs (shared prefix is content-addressed equal, so cheap)
 forge diff <head-a> <head-b>
+
+# interactive TUI: timeline on the left, content on the right
+forge view <head>
+forge view <head-a> --diff <head-b>     # aligned diff with j/k navigation
 ```
 
 End-to-end example (FakeAgent emits a 5-step conversation; we fork at the

@@ -16,10 +16,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
 forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }
 forge-openai = { path = "../forge-openai" }
 forge-storage = { path = "../forge-storage" }
+ratatui = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
