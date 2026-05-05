@@ -1,8 +1,27 @@
 # forge
 
-**Git for agent runs.** Content-addressed, branchable, diffable — including `git bisect`.
+**Git for agent runs.** Content-addressed, branchable, diffable, *and* auditable for cost.
 
 > Status: very early. Public design exploration. APIs will break.
+
+## TL;DR
+
+```bash
+$ forge audit --target-model claude-haiku-4-5 --judge-model claude-sonnet-4-6
+auditing 52 run(s) against claude-haiku-4-5 (judge: claude-sonnet-4-6)
+
+  ✓  47 EQUIVALENT  — safe to downgrade
+  ⚠   5 DIFFERENT   — keep on the original model
+
+differences:
+  • 4ca7b22f  haiku missed 2 of 3 entities
+  • 9f8e1ad3  haiku hallucinated a fourth field
+  ...
+
+review the 47 downgrades in forge web (tag: audit-claude-haiku-4-5).
+```
+
+Industry consensus in 2026: 80% of agent API calls don't need a frontier model. The hard part is figuring out *which* 80%. Forge replays each recorded run through a cheaper model, uses a strong model as judge, and tells you what's safe to downgrade.
 
 ## What it is
 
@@ -76,6 +95,7 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] Anthropic cache-hit telemetry (`cache_creation_input_tokens` / `cache_read_input_tokens`)
 - [x] `forge-rig` crate to record a [Rig](https://rig.rs) conversation
 - [x] `forge bisect` — git-bisect for agent runs (find the step that caused a failure)
+- [x] `forge audit` — replay recorded runs against cheaper models, judge equivalence, surface safe downgrades
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -140,6 +160,11 @@ forge diff <head-a> <head-b>
 # each trial forks `bad` at a divergent step with `good`'s value, drives
 # the agent forward, and checks whether the run recovered.
 forge bisect <good-head> <bad-head> --expect "sum is 5"
+
+# audit recorded runs for cost: which can be safely downgraded to haiku?
+# forge replays each prompt against the cheaper model and uses sonnet to
+# judge equivalence; trial runs persist with tag audit-<model> for review.
+forge audit --tag prod --target-model claude-haiku-4-5-20251001
 
 # interactive TUI: timeline on the left, content on the right
 forge view <head>

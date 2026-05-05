@@ -7,8 +7,8 @@ mod tui;
 mod web;
 
 use forge::{
-    auto_run_tool_after_fork, bisect_chains, default_bisect_check, diff_chains, fork_chain,
-    print_chain, render_bisect, render_diff, run_agent, run_agent_from,
+    audit_runs, auto_run_tool_after_fork, bisect_chains, default_bisect_check, diff_chains,
+    fork_chain, print_chain, render_audit, render_bisect, render_diff, run_agent, run_agent_from,
 };
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
@@ -138,6 +138,33 @@ enum Cmd {
         /// rather than answering wrong.
         #[arg(long)]
         expect: Option<String>,
+    },
+    /// Replay each recorded run against a cheaper target model, use a strong
+    /// model as judge to compare answers, and report which prompts are safe
+    /// to downgrade. Audit-the-audit: candidate trial runs are persisted with
+    /// tag `audit-<short>` so you can sanity-check the judge's verdicts in
+    /// `forge web`.
+    Audit {
+        /// Tag filter for which recorded runs to audit. If absent, audits all.
+        #[arg(long)]
+        tag: Option<String>,
+        /// Cap on the number of runs to audit. Auditing makes 2 API calls per
+        /// run (target + judge); cap defends your wallet.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Provider for the cheaper candidate model.
+        #[arg(long, value_enum, default_value_t = AgentKind::Anthropic)]
+        target_agent: AgentKind,
+        /// The cheaper model to test downgrade-readiness against.
+        #[arg(long, default_value = "claude-haiku-4-5-20251001")]
+        target_model: String,
+        /// Provider for the judge.
+        #[arg(long, value_enum, default_value_t = AgentKind::Anthropic)]
+        judge_agent: AgentKind,
+        /// The judge model. Use a strong one — its verdicts decide what gets
+        /// downgraded.
+        #[arg(long, default_value = "claude-sonnet-4-6")]
+        judge_model: String,
     },
     /// Open a TUI viewer for a single run, or pass `--diff` to view aligned
     /// diff between two runs.
@@ -555,6 +582,71 @@ async fn run() -> anyhow::Result<()> {
             println!("A: {}  ({} steps)", short(&head_a.0), chain_a.len());
             println!("B: {}  ({} steps)", short(&head_b.0), chain_b.len());
             print!("{}", render_diff(&result));
+        }
+        Cmd::Audit {
+            tag,
+            limit,
+            target_agent,
+            target_model,
+            judge_agent,
+            judge_model,
+        } => {
+            // Filter recorded runs by tag (if provided), apply limit.
+            let mut runs = storage.list_runs().await?;
+            if let Some(t) = tag.as_deref() {
+                runs.retain(|r| r.tag.as_deref() == Some(t));
+            }
+            // Don't audit the trial runs from a previous audit.
+            runs.retain(|r| !r.tag.as_deref().is_some_and(|t| t.starts_with("audit-")));
+            runs.truncate(limit);
+            if runs.is_empty() {
+                let filter_msg = tag
+                    .as_deref()
+                    .map(|t| format!(" matching tag {t:?}"))
+                    .unwrap_or_default();
+                println!("no recorded runs to audit{filter_msg}.");
+                return Ok(());
+            }
+            let heads: Vec<NodeHash> = runs.iter().map(|r| r.head.clone()).collect();
+            let target_label = target_model.replace([':', '/'], "-");
+
+            // Build closures that produce a fresh agent on each call. We
+            // capture by clone so each replay is independent.
+            let ta = target_agent;
+            let tm = target_model.clone();
+            let build_target = move |prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+                build_fresh_agent(
+                    ta,
+                    Some(prompt.to_string()),
+                    tm.clone(),
+                    Vec::new(),
+                    Some(2),
+                    false,
+                )
+            };
+            let ja = judge_agent;
+            let jm = judge_model.clone();
+            let build_judge = move |prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+                build_fresh_agent(
+                    ja,
+                    Some(prompt.to_string()),
+                    jm.clone(),
+                    Vec::new(),
+                    Some(2),
+                    false,
+                )
+            };
+
+            println!(
+                "auditing {} run(s) against {} (judge: {})",
+                heads.len(),
+                target_model,
+                judge_model
+            );
+            println!("each run makes 2 API calls (target + judge); ctrl-c to abort.\n");
+            let summary =
+                audit_runs(&*storage, &heads, &target_label, build_target, build_judge).await?;
+            print!("{}", render_audit(&summary, &target_label));
         }
         Cmd::View { run, diff } => match diff {
             None => {

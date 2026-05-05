@@ -629,6 +629,341 @@ pub fn render_bisect(result: &BisectResult) -> String {
     out
 }
 
+// -- audit -----------------------------------------------------------------
+//
+// "Am I overpaying?" 2026's most-cited LLM ops question. Teams default to
+// frontier models during prototyping and never downgrade. Routing tools
+// exist; audit tools don't. `forge audit` replays each recorded run through
+// a cheaper target model, uses a strong model as judge to compare answers,
+// and reports which prompts are safe to downgrade.
+//
+// The judge prompt is intentionally tight: produces a single verdict token
+// (EQUIVALENT or DIFFERENT) followed by one short reason line. We parse the
+// first token; the reason is for human review.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditVerdict {
+    /// Cheaper model produced an answer the judge considers equivalent.
+    Equivalent,
+    /// Judge flagged a meaningful difference.
+    Different,
+    /// Judge response wasn't parseable; treat as failure to be conservative.
+    Inconclusive,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditOutcome {
+    pub original_head: NodeHash,
+    pub original_prompt: String,
+    pub original_answer: String,
+    pub candidate_answer: String,
+    /// Head of the recorded candidate run (replay against the cheaper model).
+    pub candidate_head: NodeHash,
+    pub verdict: AuditVerdict,
+    pub judge_reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuditSummary {
+    pub outcomes: Vec<AuditOutcome>,
+}
+
+impl AuditSummary {
+    pub fn equivalent_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.verdict == AuditVerdict::Equivalent)
+            .count()
+    }
+    pub fn different_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.verdict == AuditVerdict::Different)
+            .count()
+    }
+    pub fn inconclusive_count(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| o.verdict == AuditVerdict::Inconclusive)
+            .count()
+    }
+}
+
+/// Pull the user-facing prompt and final assistant answer from a recorded
+/// chain. Skips system messages; takes the first `Prompt` step and the
+/// last assistant `Message`. Returns `None` for runs that don't match this
+/// shape (e.g. ones that ended mid-tool-call).
+pub fn extract_audit_pair(chain: &[Step]) -> Option<(String, String)> {
+    let prompt = chain.iter().find_map(|s| match &s.kind {
+        StepKind::Prompt { content, .. } => Some(content.clone()),
+        _ => None,
+    })?;
+    let answer = chain.iter().rev().find_map(|s| match &s.kind {
+        StepKind::Message { role, content } if role == "assistant" => Some(content.clone()),
+        _ => None,
+    })?;
+    Some((prompt, answer))
+}
+
+/// Audit one recorded run against a cheaper model.
+///
+/// `build_target` produces a fresh agent for the cheaper model, given the
+/// original prompt. `build_judge` produces a fresh agent for the judge,
+/// given the assembled judge prompt. Both are async because building real
+/// agents reads `from_env`.
+///
+/// The candidate run is persisted with tag `audit-cheap-<short>` so users
+/// can browse it in `forge web` and verify the judge's call.
+pub async fn audit_run<S, BuildTarget, BuildJudge>(
+    storage: &S,
+    chain: &[Step],
+    original_head: NodeHash,
+    target_label: &str,
+    mut build_target: BuildTarget,
+    mut build_judge: BuildJudge,
+) -> anyhow::Result<Option<AuditOutcome>>
+where
+    S: Storage + ?Sized,
+    BuildTarget: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+    BuildJudge: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+{
+    let Some((original_prompt, original_answer)) = extract_audit_pair(chain) else {
+        return Ok(None);
+    };
+
+    // 1) Run the cheaper model on the same prompt.
+    let mut target = build_target(&original_prompt)?;
+    let candidate_chain = run_agent(target.as_mut(), storage).await?;
+    if candidate_chain.is_empty() {
+        anyhow::bail!("audit: candidate model produced no steps");
+    }
+    let candidate_head = candidate_chain.last().cloned().unwrap();
+    let candidate_steps: Vec<Step> = {
+        let mut acc = Vec::with_capacity(candidate_chain.len());
+        for h in &candidate_chain {
+            acc.push(
+                storage
+                    .get(h)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("candidate step missing: {h}"))?,
+            );
+        }
+        acc
+    };
+    let candidate_answer = candidate_steps
+        .iter()
+        .rev()
+        .find_map(|s| match &s.kind {
+            StepKind::Message { role, content } if role == "assistant" => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    // Persist the candidate trial so it's reviewable in forge web.
+    let root = candidate_steps[0].id.clone();
+    let _ = storage
+        .record_run(&RunMeta {
+            head: candidate_head.clone(),
+            root,
+            recorded_at_ms: now_ms(),
+            tag: Some(format!("audit-{target_label}")),
+        })
+        .await;
+
+    // 2) Ask the judge.
+    let judge_prompt = build_judge_prompt(&original_prompt, &original_answer, &candidate_answer);
+    let mut judge = build_judge(&judge_prompt)?;
+    let judge_chain = run_agent(judge.as_mut(), storage).await?;
+    let judge_steps: Vec<Step> = {
+        let mut acc = Vec::with_capacity(judge_chain.len());
+        for h in &judge_chain {
+            acc.push(
+                storage
+                    .get(h)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("judge step missing: {h}"))?,
+            );
+        }
+        acc
+    };
+    let judge_answer = judge_steps
+        .iter()
+        .rev()
+        .find_map(|s| match &s.kind {
+            StepKind::Message { role, content } if role == "assistant" => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let (verdict, judge_reason) = parse_judge_verdict(&judge_answer);
+
+    Ok(Some(AuditOutcome {
+        original_head,
+        original_prompt,
+        original_answer,
+        candidate_answer,
+        candidate_head,
+        verdict,
+        judge_reason,
+    }))
+}
+
+/// Audit many runs. Caller filters runs (e.g. by tag) and passes the
+/// resulting heads in. Stops early on `--limit`. Errors on individual runs
+/// are recorded as `Inconclusive` rather than aborting the whole audit.
+pub async fn audit_runs<S, BuildTarget, BuildJudge>(
+    storage: &S,
+    heads: &[NodeHash],
+    target_label: &str,
+    mut build_target: BuildTarget,
+    mut build_judge: BuildJudge,
+) -> anyhow::Result<AuditSummary>
+where
+    S: Storage + ?Sized,
+    BuildTarget: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+    BuildJudge: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+{
+    let mut summary = AuditSummary::default();
+    for head in heads {
+        let chain = match storage.chain_to(head).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, head = %head, "audit: failed to load chain");
+                continue;
+            }
+        };
+        let result = audit_run(
+            storage,
+            &chain,
+            head.clone(),
+            target_label,
+            &mut build_target,
+            &mut build_judge,
+        )
+        .await;
+        match result {
+            Ok(Some(outcome)) => summary.outcomes.push(outcome),
+            Ok(None) => {
+                tracing::debug!(head = %head, "audit: skipping run with no Prompt+Message pair");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, head = %head, "audit: trial failed; recording as inconclusive");
+                summary.outcomes.push(AuditOutcome {
+                    original_head: head.clone(),
+                    original_prompt: String::new(),
+                    original_answer: String::new(),
+                    candidate_answer: String::new(),
+                    candidate_head: head.clone(),
+                    verdict: AuditVerdict::Inconclusive,
+                    judge_reason: format!("trial errored: {e}"),
+                });
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// The judge prompt is the load-bearing piece. Designed to be tight and to
+/// produce a parseable single-token verdict. Equivalence is task-agnostic —
+/// "would a user notice the difference?" — which biases toward DIFFERENT
+/// when in doubt (the conservative direction for a cost-cut decision).
+fn build_judge_prompt(prompt: &str, original: &str, candidate: &str) -> String {
+    format!(
+        "You are an impartial judge comparing two answers to the same user request.\n\
+        \n\
+        USER REQUEST:\n{prompt}\n\
+        \n\
+        ANSWER A (reference):\n{original}\n\
+        \n\
+        ANSWER B (candidate):\n{candidate}\n\
+        \n\
+        Would a user notice a meaningful difference between A and B for the request? \
+        Consider correctness, completeness, structure, and whether key facts match. \
+        Stylistic differences alone are not meaningful.\n\
+        \n\
+        Respond with exactly one word on the first line: EQUIVALENT or DIFFERENT.\n\
+        On the second line, give a single short sentence explaining why."
+    )
+}
+
+fn parse_judge_verdict(judge_text: &str) -> (AuditVerdict, String) {
+    let mut lines = judge_text.lines();
+    let first = lines.next().unwrap_or("").trim().to_uppercase();
+    let reason = lines
+        .next()
+        .map(|l| l.trim().to_string())
+        .unwrap_or_default();
+    let verdict = if first.starts_with("EQUIVALENT") {
+        AuditVerdict::Equivalent
+    } else if first.starts_with("DIFFERENT") {
+        AuditVerdict::Different
+    } else {
+        // Some judges put the verdict mid-line; do a lenient scan.
+        let upper = judge_text.to_uppercase();
+        if upper.contains("EQUIVALENT") && !upper.contains("DIFFERENT") {
+            AuditVerdict::Equivalent
+        } else if upper.contains("DIFFERENT") {
+            AuditVerdict::Different
+        } else {
+            AuditVerdict::Inconclusive
+        }
+    };
+    (verdict, reason)
+}
+
+pub fn render_audit(summary: &AuditSummary, target_label: &str) -> String {
+    let total = summary.outcomes.len();
+    let eq = summary.equivalent_count();
+    let diff = summary.different_count();
+    let inc = summary.inconclusive_count();
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "audited {total} run(s) against {target_label}.\n\n"
+    ));
+    out.push_str(&format!("  ✓ {eq:>3} EQUIVALENT  — safe to downgrade\n"));
+    out.push_str(&format!(
+        "  ⚠ {diff:>3} DIFFERENT   — keep on the original model\n"
+    ));
+    if inc > 0 {
+        out.push_str(&format!(
+            "  ? {inc:>3} INCONCLUSIVE — judge couldn't decide\n"
+        ));
+    }
+    out.push('\n');
+
+    if diff > 0 {
+        out.push_str("differences:\n");
+        for o in &summary.outcomes {
+            if o.verdict == AuditVerdict::Different {
+                out.push_str(&format!(
+                    "  • {}  {}\n",
+                    short(&o.original_head.0),
+                    one_line(&o.judge_reason, 80)
+                ));
+            }
+        }
+        out.push('\n');
+    }
+
+    if eq > 0 {
+        out.push_str(&format!(
+            "review the {eq} downgrades in forge web (tag: audit-{target_label}).\n"
+        ));
+    }
+    out
+}
+
+fn one_line(s: &str, max: usize) -> String {
+    let collapsed = s.lines().next().unwrap_or("").trim();
+    if collapsed.chars().count() > max {
+        let head: String = collapsed.chars().take(max - 3).collect();
+        format!("{head}...")
+    } else {
+        collapsed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,5 +1473,174 @@ mod tests {
         let trial = &result.trials[result.first_recoverable.unwrap()];
         assert_eq!(trial.bad_index, 1);
         assert_eq!(trial.final_text.as_deref(), Some("result: 42"));
+    }
+
+    #[test]
+    fn parse_judge_verdict_handles_canonical_forms() {
+        let (v, r) = parse_judge_verdict("EQUIVALENT\nthey say the same thing");
+        assert_eq!(v, AuditVerdict::Equivalent);
+        assert_eq!(r, "they say the same thing");
+
+        let (v, _) = parse_judge_verdict("DIFFERENT\nthe candidate omits a key fact");
+        assert_eq!(v, AuditVerdict::Different);
+
+        // Lenient mid-line scan for less obedient judges.
+        let (v, _) = parse_judge_verdict("After review, the answers are EQUIVALENT.");
+        assert_eq!(v, AuditVerdict::Equivalent);
+
+        // Falls through to inconclusive when neither verdict appears.
+        let (v, _) = parse_judge_verdict("I'm not sure.");
+        assert_eq!(v, AuditVerdict::Inconclusive);
+    }
+
+    #[test]
+    fn extract_audit_pair_pulls_first_prompt_and_last_assistant() {
+        let chain = vec![
+            Step::new(
+                None,
+                StepKind::Prompt {
+                    model: "m".into(),
+                    content: "what is 2+3?".into(),
+                },
+                0,
+            ),
+            Step::new(None, msg("assistant", "I will compute."), 0),
+            Step::new(None, msg("assistant", "5"), 0),
+        ];
+        let (p, a) = extract_audit_pair(&chain).unwrap();
+        assert_eq!(p, "what is 2+3?");
+        assert_eq!(a, "5");
+
+        // Chains without an assistant message return None.
+        let chain = vec![Step::new(
+            None,
+            StepKind::Prompt {
+                model: "m".into(),
+                content: "x".into(),
+            },
+            0,
+        )];
+        assert!(extract_audit_pair(&chain).is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_run_records_equivalent_when_judge_says_so() {
+        let storage = MemoryStorage::new();
+        // Recorded run: prompt + assistant answer.
+        let chain = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "sonnet".into(),
+                    content: "What's the capital of France?".into(),
+                },
+                msg("assistant", "Paris."),
+            ],
+        )
+        .await;
+        let head = chain.last().unwrap().id.clone();
+
+        // Target (cheap model) gives an equivalent answer.
+        let target_builder = |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| {
+                "Paris is the capital.".into()
+            })) as Box<dyn Agent>)
+        };
+        // Judge says EQUIVALENT.
+        let judge_builder = |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| {
+                "EQUIVALENT\nboth identify Paris".into()
+            })) as Box<dyn Agent>)
+        };
+
+        let outcome = audit_run(
+            &storage,
+            &chain,
+            head.clone(),
+            "haiku",
+            target_builder,
+            judge_builder,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome.verdict, AuditVerdict::Equivalent);
+        assert_eq!(outcome.original_answer, "Paris.");
+        assert_eq!(outcome.candidate_answer, "Paris is the capital.");
+        assert!(outcome.judge_reason.contains("Paris"));
+
+        // Candidate trial was persisted with audit tag.
+        let runs = storage.list_runs().await.unwrap();
+        assert!(runs.iter().any(|r| r.tag.as_deref() == Some("audit-haiku")));
+    }
+
+    #[tokio::test]
+    async fn audit_runs_aggregates_mixed_verdicts() {
+        let storage = MemoryStorage::new();
+
+        let head_a = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "sonnet".into(),
+                    content: "easy task".into(),
+                },
+                msg("assistant", "A1"),
+            ],
+        )
+        .await
+        .last()
+        .unwrap()
+        .id
+        .clone();
+        let head_b = build_chain(
+            &storage,
+            vec![
+                StepKind::Prompt {
+                    model: "sonnet".into(),
+                    content: "hard task".into(),
+                },
+                msg("assistant", "B1"),
+            ],
+        )
+        .await
+        .last()
+        .unwrap()
+        .id
+        .clone();
+
+        let target_builder = |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| {
+                "candidate answer".into()
+            })) as Box<dyn Agent>)
+        };
+        // Judge: alternates between EQUIVALENT and DIFFERENT to cover both.
+        let mut call = 0u8;
+        let judge_builder = move |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+            call += 1;
+            let verdict = if call % 2 == 1 {
+                "EQUIVALENT\nfine"
+            } else {
+                "DIFFERENT\nmissed a fact"
+            };
+            let resp = verdict.to_string();
+            Ok(Box::new(ScriptedAgent::new(Vec::new(), move |_| resp.clone())) as Box<dyn Agent>)
+        };
+
+        let summary = audit_runs(
+            &storage,
+            &[head_a, head_b],
+            "haiku",
+            target_builder,
+            judge_builder,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.outcomes.len(), 2);
+        assert_eq!(summary.equivalent_count(), 1);
+        assert_eq!(summary.different_count(), 1);
+        assert_eq!(summary.inconclusive_count(), 0);
     }
 }
