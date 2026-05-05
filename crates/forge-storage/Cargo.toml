@@ -10,4 +10,10 @@ description = "Storage backends for Forge agent run graphs."
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 forge-core = { path = "../forge-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sled = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

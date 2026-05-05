@@ -36,14 +36,24 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 ## Roadmap
 
 - [x] Workspace skeleton, core types, in-memory storage
-- [ ] `forge run` against a stub agent harness
-- [ ] sled backend
-- [ ] `forge diff` with semantic step alignment
-- [ ] `forge replay` with seeded model nondeterminism
-- [ ] `forge fork` mid-run
-- [ ] Postgres backend (durable resume across machines)
+- [x] `forge run` against a stub agent harness (FakeAgent)
+- [x] sled backend; `forge runs` and `forge replay` read from disk
+- [ ] Adapter for [Rig](https://rig.rs/) — real LLM agents
+- [ ] HTTP recorder middleware (drop-in for any agent)
+- [ ] `forge fork <run>@<step>` — load state, swap one variable, drive forward
+- [ ] `forge diff` v0: structural alignment of tool calls
+- [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
+- [ ] Deterministic replay (seeded where APIs allow, full request/response capture)
+- [ ] Postgres backend (durable resume across machines, large blob dedup)
 - [ ] TUI viewer (`ratatui`)
-- [ ] Adapter for [Rig](https://rig.rs/)
+
+## Quick start
+
+```bash
+cargo run -- run                    # record a fake run to ./forge.db
+cargo run -- runs                   # list recorded runs
+cargo run -- replay <prefix>        # walk the chain back from disk
+```
 
 ## License
 

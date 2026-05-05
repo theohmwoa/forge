@@ -1,12 +1,16 @@
-//! Storage backend trait for Forge.
+//! Storage backends for Forge.
 //!
-//! A `Storage` is the persistence layer for the content-addressed step graph.
-//! In-memory backend ships first; sled and Postgres come next.
+//! `Storage` is the persistence trait. `MemoryStorage` is the in-process
+//! backend (fast, ephemeral; primarily for tests). `SledStorage` is the
+//! single-process durable backend.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use forge_core::{NodeHash, Step};
+
+mod sled_store;
+pub use sled_store::{RunMeta, SledStorage};
 
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
