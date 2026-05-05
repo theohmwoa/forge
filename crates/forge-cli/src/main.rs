@@ -1,5 +1,9 @@
 use clap::{Parser, Subcommand};
 
+use forge::{print_chain, run_agent};
+use forge_core::agent::FakeAgent;
+use forge_storage::MemoryStorage;
+
 #[derive(Parser)]
 #[command(name = "forge", version, about = "Git for agent runs.")]
 struct Cli {
@@ -11,8 +15,8 @@ struct Cli {
 enum Cmd {
     /// Run an agent and record every step into the graph.
     Run {
-        /// Path to a run spec (TOML/YAML).
-        spec: String,
+        /// Path to a run spec (TOML/YAML). Ignored in v0.0.1; uses FakeAgent.
+        spec: Option<String>,
     },
     /// Fork an existing run from a specific step.
     Fork {
@@ -35,7 +39,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Run { spec } => {
-            tracing::info!(?spec, "run: not yet implemented");
+            if let Some(spec) = spec {
+                tracing::warn!(?spec, "spec parsing not yet implemented; using FakeAgent");
+            }
+            let storage = MemoryStorage::new();
+            let mut agent = FakeAgent::scripted();
+            let chain = run_agent(&mut agent, &storage).await?;
+            println!("run complete: {} steps\n--- dag ---", chain.len());
+            print_chain(&storage, &chain).await?;
         }
         Cmd::Fork { run, at } => {
             tracing::info!(?run, ?at, "fork: not yet implemented");

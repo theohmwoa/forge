@@ -6,6 +6,9 @@ license.workspace = true
 repository.workspace = true
 description = "Forge: git for agent runs."
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "forge"
 path = "src/main.rs"

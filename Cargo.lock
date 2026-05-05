@@ -210,10 +210,12 @@ dependencies = [
 name = "forge-core"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "blake3",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
