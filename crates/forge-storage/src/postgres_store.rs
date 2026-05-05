@@ -65,10 +65,59 @@ impl PostgresStorage {
     /// Connect to a Postgres URL (`postgres://user:pass@host:port/db`) and
     /// run the (idempotent) schema migration.
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(url)
+            .await
+            .map_err(|e| friendly_connect_error(url, e))?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         Ok(Self { pool })
     }
+}
+
+/// Translate sqlx connect errors into a one-line message that says what's
+/// actually wrong. Falls back to the original error chain otherwise.
+fn friendly_connect_error(url: &str, err: sqlx::Error) -> anyhow::Error {
+    // sqlx wraps the underlying Postgres error in `Database`, and the
+    // network-level errors in `Io`. We probe both.
+    if let sqlx::Error::Database(db) = &err {
+        if let Some(code) = db.code() {
+            // SQLSTATE codes from libpq.
+            return match code.as_ref() {
+                // invalid_password / invalid_authorization_specification
+                "28P01" | "28000" => {
+                    anyhow::anyhow!("postgres auth failed: bad username or password ({url})")
+                }
+                // invalid_catalog_name
+                "3D000" => {
+                    anyhow::anyhow!("postgres database does not exist ({url})")
+                }
+                _ => anyhow::Error::from(err),
+            };
+        }
+    }
+    if let sqlx::Error::Io(io) = &err {
+        return match io.kind() {
+            std::io::ErrorKind::ConnectionRefused => {
+                anyhow::anyhow!("postgres host is unreachable: connection refused ({url})")
+            }
+            std::io::ErrorKind::TimedOut => {
+                anyhow::anyhow!("postgres host is unreachable: connection timed out ({url})")
+            }
+            _ => anyhow::Error::from(err),
+        };
+    }
+    // Hostname resolution failures land in sqlx::Error::Tls or surface as a
+    // wrapped io error inside the message; match on the rendered string as
+    // a last resort.
+    let msg = err.to_string();
+    if msg.contains("failed to lookup address")
+        || msg.contains("nodename nor servname")
+        || msg.contains("Name or service not known")
+    {
+        return anyhow::anyhow!("postgres host is unreachable: dns lookup failed ({url})");
+    }
+    anyhow::Error::from(err)
 }
 
 #[async_trait]

@@ -29,8 +29,9 @@ Cargo workspace, three crates:
 |---|---|
 | `forge-core` | step types, hashes, graph invariants, `Agent` / `Matcher` / `Tool` traits |
 | `forge-storage` | `Storage` trait, `MemoryStorage`, `SledStorage` |
-| `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use) |
+| `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use, prompt caching) |
 | `forge-openai` | OpenAI Chat Completions adapter (multi-turn tool use) |
+| `forge-gemini` | Google Gemini `generateContent` adapter (multi-turn function calling) |
 | `forge-cli` | the `forge` binary (`run`, `runs`, `replay`, `continue`, `fork`, `diff`) |
 
 Storage backends planned: in-memory (done), sled, Postgres (single source of truth, durable resume).
@@ -63,6 +64,11 @@ Storage backends planned: in-memory (done), sled, Postgres (single source of tru
 - [x] `examples/` with runnable scripts
 - [x] Postgres backend (`--db postgres://...`) for multi-process / multi-machine
 - [x] OpenAI SSE streaming (matches Anthropic; `--stream` works on both)
+- [x] Gemini adapter (`--agent gemini`, multi-turn function calling, streaming)
+- [x] Anthropic prompt caching (`cache_control: ephemeral` on the latest input block)
+- [x] `forge web` token-level inline diff for modified steps
+- [x] Friendly Postgres connect errors (one-line messages for auth / DNS / refused)
+- [x] `--public` flag on `forge serve` and `forge web` to opt-in to non-localhost bind
 - [ ] HTTP recorder middleware (drop-in for any agent)
 - [ ] Adapter for [Rig](https://rig.rs/) (thin shim once tool-use lands)
 - [ ] `forge diff` v1: LLM-judge for "why did these diverge?"
@@ -95,6 +101,10 @@ forge run --agent anthropic --tools calculator --prompt "what is 47 * 53?"
 # OpenAI works the same way
 export OPENAI_API_KEY=...
 forge run --agent openai --model gpt-5 --tools calculator --prompt "what is 47 * 53?"
+
+# Gemini, ditto
+export GEMINI_API_KEY=...
+forge run --agent gemini --model gemini-2.5-flash --tools calculator --prompt "what is 47 * 53?"
 
 # list recorded runs
 forge runs

@@ -109,6 +109,33 @@
   }
   .diff-A pre { color: var(--only-a); }
   .diff-B pre { color: var(--only-b); }
+  .tok-equal { color: var(--muted); }
+  .tok-delete {
+    background: rgba(224, 108, 117, 0.18);
+    color: var(--only-a);
+    text-decoration: line-through;
+    text-decoration-color: rgba(224, 108, 117, 0.6);
+  }
+  .tok-insert {
+    background: rgba(152, 195, 121, 0.18);
+    color: var(--only-b);
+  }
+  .diff-toggle {
+    margin: 4px 0 14px 0;
+    display: flex;
+    gap: 8px;
+  }
+  .diff-toggle button {
+    background: #222;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 8px;
+    cursor: pointer;
+    border-radius: 3px;
+  }
+  .diff-toggle button.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
 </style>
 </head>
 <body>
@@ -127,6 +154,7 @@ const state = {
   aligned: null,
   selectedStep: null,
   selectedAligned: null,
+  diffMode: 'inline',
 };
 
 async function fetchJSON(url) {
@@ -276,16 +304,39 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[c]);
 }
 
+function renderInlineTokenDiff(chunks) {
+  if (!chunks || !chunks.length) return '';
+  return chunks.map(c => {
+    const cls = 'tok-' + c.tag;
+    return `<span class="${cls}">${escapeHtml(c.text)}</span>`;
+  }).join('');
+}
+
 function renderContent() {
   const el = document.getElementById('content');
   if (state.aligned && state.selectedAligned) {
     const a = state.selectedAligned;
     if (a.kind === 'modified') {
+      const inlineActive = state.diffMode === 'inline' ? 'active' : '';
+      const splitActive = state.diffMode === 'split' ? 'active' : '';
+      const body = state.diffMode === 'inline'
+        ? `<pre>${renderInlineTokenDiff(a.token_diff)}</pre>`
+        : `<div class="diff-A"><h2>A</h2><pre>${escapeHtml(stepBody(a.a))}</pre></div>
+           <div style="height: 12px"></div>
+           <div class="diff-B"><h2>B</h2><pre>${escapeHtml(stepBody(a.b))}</pre></div>`;
       el.innerHTML = `
         <h2>modified · ${stepLabel(a.a)}</h2>
-        <div class="diff-A"><h2>A</h2><pre>${escapeHtml(stepBody(a.a))}</pre></div>
-        <div style="height: 12px"></div>
-        <div class="diff-B"><h2>B</h2><pre>${escapeHtml(stepBody(a.b))}</pre></div>`;
+        <div class="diff-toggle">
+          <button data-mode="inline" class="${inlineActive}">inline</button>
+          <button data-mode="split" class="${splitActive}">split</button>
+        </div>
+        ${body}`;
+      el.querySelectorAll('.diff-toggle button').forEach(b => {
+        b.onclick = () => {
+          state.diffMode = b.dataset.mode;
+          renderContent();
+        };
+      });
     } else if (a.kind === 'only_a') {
       el.innerHTML = `<h2 style="color: var(--only-a)">only in A · ${stepLabel(a.step)}</h2><pre>${escapeHtml(stepBody(a.step))}</pre>`;
     } else if (a.kind === 'only_b') {

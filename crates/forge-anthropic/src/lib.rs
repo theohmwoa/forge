@@ -27,6 +27,9 @@ pub struct AnthropicConfig {
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
+    /// Optional system prompt. When set, sent with `cache_control: ephemeral`
+    /// so subsequent calls hit the cache instead of re-paying the input tokens.
+    pub system: Option<String>,
 }
 
 impl AnthropicConfig {
@@ -37,7 +40,13 @@ impl AnthropicConfig {
             api_key,
             model: model.into(),
             max_tokens: 1024,
+            system: None,
         })
+    }
+
+    pub fn with_system(mut self, system: impl Into<String>) -> Self {
+        self.system = Some(system.into());
+        self
     }
 }
 
@@ -217,6 +226,7 @@ impl AnthropicAgent {
             "max_tokens": self.config.max_tokens,
             "messages": history,
         });
+        apply_prompt_caching(&mut req, self.config.system.as_deref());
         let schemas = self.tool_schemas();
         if !schemas.is_empty() {
             req["tools"] = json!(schemas);
@@ -262,6 +272,7 @@ impl AnthropicAgent {
             "messages": history,
             "stream": true,
         });
+        apply_prompt_caching(&mut req, self.config.system.as_deref());
         let schemas = self.tool_schemas();
         if !schemas.is_empty() {
             req["tools"] = json!(schemas);
@@ -366,6 +377,47 @@ impl Agent for AnthropicAgent {
             }
         }
         self.pending.pop_front()
+    }
+}
+
+/// Mark the most recent input block with `cache_control: ephemeral` so the
+/// Anthropic prompt cache can match this prefix on subsequent calls. The win
+/// is biggest on multi-turn tool use loops (every turn after the first reads
+/// the cached prefix instead of re-paying input tokens) and on continuations
+/// (the prefix is already known to repeat).
+///
+/// Also injects the system prompt with cache_control when one is configured.
+fn apply_prompt_caching(req: &mut Value, system: Option<&str>) {
+    if let Some(sys) = system {
+        req["system"] = json!([{
+            "type": "text",
+            "text": sys,
+            "cache_control": {"type": "ephemeral"}
+        }]);
+    }
+
+    let Some(messages) = req["messages"].as_array_mut() else {
+        return;
+    };
+    let Some(last_msg) = messages.last_mut() else {
+        return;
+    };
+    let content = &mut last_msg["content"];
+    // The Messages API accepts either a plain string or an array of typed
+    // content blocks. Normalize both into an array we can tag.
+    if let Some(s) = content.as_str() {
+        let s = s.to_string();
+        last_msg["content"] = json!([{
+            "type": "text",
+            "text": s,
+            "cache_control": {"type": "ephemeral"}
+        }]);
+    } else if let Some(arr) = content.as_array_mut() {
+        if let Some(last) = arr.last_mut() {
+            if let Some(obj) = last.as_object_mut() {
+                obj.insert("cache_control".into(), json!({"type": "ephemeral"}));
+            }
+        }
     }
 }
 
@@ -540,6 +592,7 @@ mod tests {
                 api_key: "x".into(),
                 model: "claude-sonnet-4-6".into(),
                 max_tokens: 1024,
+                system: None,
             },
             "what is 2 + 3?",
         )
@@ -547,6 +600,47 @@ mod tests {
         let schemas = agent.tool_schemas();
         assert_eq!(schemas.len(), 1);
         assert_eq!(schemas[0]["name"], "calculator");
+    }
+
+    #[test]
+    fn cache_control_tags_last_block_in_string_content() {
+        let mut req = json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        apply_prompt_caching(&mut req, None);
+        let last = &req["messages"][0]["content"][0];
+        assert_eq!(last["type"], "text");
+        assert_eq!(last["text"], "hello");
+        assert_eq!(last["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_tags_last_block_in_array_content() {
+        let mut req = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "5"},
+                    {"type": "text", "text": "next"}
+                ]
+            }]
+        });
+        apply_prompt_caching(&mut req, None);
+        let blocks = req["messages"][0]["content"].as_array().unwrap();
+        // First block left alone; last one is tagged.
+        assert!(blocks[0].get("cache_control").is_none());
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn cache_control_attaches_system_prompt() {
+        let mut req = json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        apply_prompt_caching(&mut req, Some("you are a helpful assistant"));
+        assert_eq!(req["system"][0]["type"], "text");
+        assert_eq!(req["system"][0]["text"], "you are a helpful assistant");
+        assert_eq!(req["system"][0]["cache_control"]["type"], "ephemeral");
     }
 
     #[test]

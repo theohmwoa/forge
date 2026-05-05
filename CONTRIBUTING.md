@@ -28,6 +28,7 @@ crates/
 ├── forge-anthropic   # Anthropic Messages API adapter
 ├── forge-cli         # the `forge` binary (this is what cargo install builds)
 ├── forge-core        # step types + Agent / Tool / Matcher traits
+├── forge-gemini      # Google Gemini generateContent adapter
 ├── forge-openai      # OpenAI Chat Completions adapter
 ├── forge-recorder    # axum proxy: records LLM calls into Forge
 └── forge-storage     # Storage trait + Memory / Sled / Postgres backends

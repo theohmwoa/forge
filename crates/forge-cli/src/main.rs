@@ -14,6 +14,7 @@ use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
 use forge_core::tool::{Calculator, Tool};
 use forge_core::{NodeHash, Step};
+use forge_gemini::{GeminiAgent, GeminiConfig};
 use forge_openai::{OpenAIAgent, OpenAIConfig};
 use forge_storage::{PostgresStorage, RunMeta, SledStorage, Storage};
 
@@ -126,16 +127,28 @@ enum Cmd {
     Serve {
         #[arg(long, default_value_t = 7878)]
         port: u16,
+        /// Address to bind to. Ignored when `--public` is set.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Bind to 0.0.0.0 (all interfaces). The recorder proxies your API
+        /// keys upstream, so do NOT enable this on an untrusted network without
+        /// also putting auth in front of it.
+        #[arg(long, default_value_t = false)]
+        public: bool,
     },
     /// Serve a local web viewer over the run graph. Single embedded HTML page
     /// + JSON API; localhost-only by default.
     Web {
         #[arg(long, default_value_t = 7879)]
         port: u16,
+        /// Address to bind to. Ignored when `--public` is set.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// Bind to 0.0.0.0 (all interfaces). The web viewer exposes recorded
+        /// run contents (prompts, tool calls, model output). Only enable on a
+        /// trusted network.
+        #[arg(long, default_value_t = false)]
+        public: bool,
     },
 }
 
@@ -144,6 +157,7 @@ enum AgentKind {
     Fake,
     Anthropic,
     Openai,
+    Gemini,
 }
 
 fn build_fresh_agent(
@@ -180,6 +194,18 @@ fn build_fresh_agent(
             }
             Ok(Box::new(a))
         }
+        AgentKind::Gemini => {
+            let prompt =
+                prompt.ok_or_else(|| anyhow::anyhow!("--prompt is required for --agent gemini"))?;
+            let cfg = GeminiConfig::from_env(model)?;
+            let mut a = GeminiAgent::new(cfg, prompt)
+                .with_tools(tools)
+                .with_streaming(stream);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
     }
 }
 
@@ -192,7 +218,9 @@ fn build_continuing_agent(
 ) -> anyhow::Result<Box<dyn Agent>> {
     match kind {
         AgentKind::Fake => {
-            anyhow::bail!("--continue does not support --agent fake; use anthropic or openai")
+            anyhow::bail!(
+                "--continue does not support --agent fake; use anthropic, openai, or gemini"
+            )
         }
         AgentKind::Anthropic => {
             let cfg = AnthropicConfig::from_env(model)?;
@@ -205,6 +233,14 @@ fn build_continuing_agent(
         AgentKind::Openai => {
             let cfg = OpenAIConfig::from_env(model)?;
             let mut a = OpenAIAgent::continuing(cfg, prefix).with_tools(tools);
+            if let Some(n) = max_turns {
+                a = a.with_max_turns(n);
+            }
+            Ok(Box::new(a))
+        }
+        AgentKind::Gemini => {
+            let cfg = GeminiConfig::from_env(model)?;
+            let mut a = GeminiAgent::continuing(cfg, prefix).with_tools(tools);
             if let Some(n) = max_turns {
                 a = a.with_max_turns(n);
             }
@@ -443,14 +479,21 @@ async fn run() -> anyhow::Result<()> {
                 tui::view_diff(chain_a, chain_b, short(&head_a.0), short(&head_b.0))?;
             }
         },
-        Cmd::Serve { port, host } => {
+        Cmd::Serve { port, host, public } => {
             let state = Arc::new(forge_recorder::RecorderState {
                 storage: Arc::clone(&storage),
                 client: reqwest::Client::new(),
             });
             let app = forge_recorder::router(state);
-            let addr = format!("{host}:{port}");
+            let bind_host = if public { "0.0.0.0" } else { host.as_str() };
+            let addr = format!("{bind_host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
+            if public {
+                println!(
+                    "WARNING: forge serve is bound to 0.0.0.0 — anyone reaching this port can\n\
+                     proxy through your upstream API keys. Put auth in front of it before exposing."
+                );
+            }
             println!("forge serve listening on http://{addr}");
             println!();
             println!("for an Anthropic client:");
@@ -465,12 +508,20 @@ async fn run() -> anyhow::Result<()> {
             println!("press ctrl-c to stop");
             axum::serve(listener, app).await?;
         }
-        Cmd::Web { port, host } => {
+        Cmd::Web { port, host, public } => {
             let app = web::router(web::WebState {
                 storage: Arc::clone(&storage),
             });
-            let addr = format!("{host}:{port}");
+            let bind_host = if public { "0.0.0.0" } else { host.as_str() };
+            let addr = format!("{bind_host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
+            if public {
+                println!(
+                    "WARNING: forge web is bound to 0.0.0.0 — anyone reaching this port can read\n\
+                     your recorded prompts, tool calls, and model outputs. Only do this on a\n\
+                     trusted network."
+                );
+            }
             println!("forge web viewer at http://{addr}");
             println!("(shift-click two runs to diff them)");
             println!();

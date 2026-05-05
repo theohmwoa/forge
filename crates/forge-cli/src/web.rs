@@ -14,10 +14,11 @@ use axum::{
     Json, Router,
 };
 use forge::diff_chains;
-use forge_core::NodeHash;
+use forge_core::{NodeHash, Step, StepKind};
 use forge_storage::Storage;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use similar::{ChangeTag, TextDiff};
 
 const INDEX_HTML: &str = include_str!("./web.html");
 
@@ -77,7 +78,12 @@ async fn diff(
         .map(|entry| match entry {
             forge::AlignedStep::Match(a, _) => json!({ "kind": "match", "step": a }),
             forge::AlignedStep::Modified(a, b) => {
-                json!({ "kind": "modified", "a": a, "b": b })
+                json!({
+                    "kind": "modified",
+                    "a": a,
+                    "b": b,
+                    "token_diff": token_diff_chunks(a, b),
+                })
             }
             forge::AlignedStep::OnlyA(s) => json!({ "kind": "only_a", "step": s }),
             forge::AlignedStep::OnlyB(s) => json!({ "kind": "only_b", "step": s }),
@@ -88,6 +94,38 @@ async fn diff(
         "prefix": chain_a.iter().take(result.common_prefix_len).collect::<Vec<_>>(),
         "aligned": aligned,
     })))
+}
+
+/// Render a step's body the same way the front-end does, so the token diff
+/// matches what the user sees.
+fn step_body(step: &Step) -> String {
+    match &step.kind {
+        StepKind::Prompt { content, .. } => content.clone(),
+        StepKind::Message { content, .. } => content.clone(),
+        StepKind::ToolCall { input, .. } => serde_json::to_string_pretty(input).unwrap_or_default(),
+        StepKind::ToolResult { output, .. } => {
+            serde_json::to_string_pretty(output).unwrap_or_default()
+        }
+    }
+}
+
+/// Word-level diff over the rendered bodies of two modified steps. Returns a
+/// flat list of `{tag: equal|delete|insert, text: ...}` chunks the front-end
+/// can colorize inline.
+fn token_diff_chunks(a: &Step, b: &Step) -> Vec<Value> {
+    let body_a = step_body(a);
+    let body_b = step_body(b);
+    let diff = TextDiff::from_words(&body_a, &body_b);
+    let mut out = Vec::new();
+    for change in diff.iter_all_changes() {
+        let tag = match change.tag() {
+            ChangeTag::Equal => "equal",
+            ChangeTag::Delete => "delete",
+            ChangeTag::Insert => "insert",
+        };
+        out.push(json!({ "tag": tag, "text": change.value() }));
+    }
+    out
 }
 
 struct ApiError(anyhow::Error);

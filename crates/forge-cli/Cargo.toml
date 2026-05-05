@@ -21,12 +21,14 @@ serde = { workspace = true }
 crossterm = { workspace = true }
 forge-anthropic = { path = "../forge-anthropic" }
 forge-core = { path = "../forge-core" }
+forge-gemini = { path = "../forge-gemini" }
 forge-openai = { path = "../forge-openai" }
 forge-recorder = { path = "../forge-recorder" }
 forge-storage = { path = "../forge-storage" }
 ratatui = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+similar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
