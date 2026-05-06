@@ -25,12 +25,42 @@ use forge_core::{NodeHash, Step, StepKind};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 
-const API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const PUBLIC_API_BASE: &str = "https://generativelanguage.googleapis.com/v1beta/models";
+const VERTEX_API_BASE: &str = "https://aiplatform.googleapis.com/v1";
 const DEFAULT_MAX_TURNS: usize = 16;
+/// Sentinel key used inside `ToolCall.input` to round-trip Gemini 3.x's
+/// `thoughtSignature` through the Forge graph. Stripped on serialization;
+/// invisible to tool implementations.
+const THOUGHT_SIGNATURE_KEY: &str = "__forge_gemini_thought_signature";
+
+/// Resolve the configured `maxOutputTokens` from the environment, falling
+/// back to `default_value`. Useful when the caller wants longer responses
+/// without rebuilding the binary (`FORGE_GEMINI_MAX_TOKENS=8192`).
+fn env_max_output_tokens(default_value: u32) -> u32 {
+    std::env::var("FORGE_GEMINI_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default_value)
+}
+
+/// How the agent authenticates to Google.
+///
+/// - `ApiKey` hits the public Gemini API (`generativelanguage.googleapis.com`).
+/// - `Vertex` hits Vertex AI (`aiplatform.googleapis.com`) with a short-lived
+///   ADC bearer token. The project and location are baked into the URL.
+#[derive(Debug, Clone)]
+pub enum GeminiCredential {
+    ApiKey(String),
+    Vertex {
+        access_token: String,
+        project: String,
+        location: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct GeminiConfig {
-    pub api_key: String,
+    pub credential: GeminiCredential,
     pub model: String,
     pub max_output_tokens: u32,
     /// Optional system instruction. Sent as Gemini's `systemInstruction`.
@@ -38,21 +68,87 @@ pub struct GeminiConfig {
 }
 
 impl GeminiConfig {
+    /// Build a config from environment.
+    ///
+    /// Vertex AI mode is selected by setting `FORGE_VERTEX=1` (or any non-empty
+    /// value). In that mode, the access token is read from
+    /// `GOOGLE_VERTEX_ACCESS_TOKEN` (callers typically populate this from
+    /// `gcloud auth application-default print-access-token`), the project from
+    /// `FORGE_VERTEX_PROJECT` (or `GOOGLE_CLOUD_PROJECT`), and the location
+    /// from `FORGE_VERTEX_LOCATION` (defaults to `global`).
+    ///
+    /// Otherwise, the public Gemini API is used with `GEMINI_API_KEY` (or
+    /// `GOOGLE_API_KEY`).
     pub fn from_env(model: impl Into<String>) -> anyhow::Result<Self> {
+        if std::env::var("FORGE_VERTEX")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+        {
+            let access_token = std::env::var("GOOGLE_VERTEX_ACCESS_TOKEN").map_err(|_| {
+                anyhow::anyhow!(
+                    "FORGE_VERTEX=1 but GOOGLE_VERTEX_ACCESS_TOKEN is not set. \
+                     Populate it with `gcloud auth application-default print-access-token` \
+                     (tokens expire after ~1h)."
+                )
+            })?;
+            let project = std::env::var("FORGE_VERTEX_PROJECT")
+                .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
+                .map_err(|_| {
+                    anyhow::anyhow!("FORGE_VERTEX=1 requires FORGE_VERTEX_PROJECT (or GOOGLE_CLOUD_PROJECT)")
+                })?;
+            let location =
+                std::env::var("FORGE_VERTEX_LOCATION").unwrap_or_else(|_| "global".to_string());
+            return Ok(Self::vertex(access_token, project, location, model));
+        }
         let api_key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("GOOGLE_API_KEY"))
             .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY (or GOOGLE_API_KEY) not set"))?;
         Ok(Self {
-            api_key,
+            credential: GeminiCredential::ApiKey(api_key),
             model: model.into(),
-            max_output_tokens: 1024,
+            max_output_tokens: env_max_output_tokens(8192),
             system: None,
         })
+    }
+
+    /// Build a Vertex AI config. The access token is short-lived; refresh
+    /// upstream (e.g. by re-running `gcloud auth application-default
+    /// print-access-token`) before invoking again after expiry.
+    pub fn vertex(
+        access_token: impl Into<String>,
+        project: impl Into<String>,
+        location: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            credential: GeminiCredential::Vertex {
+                access_token: access_token.into(),
+                project: project.into(),
+                location: location.into(),
+            },
+            model: model.into(),
+            max_output_tokens: env_max_output_tokens(8192),
+            system: None,
+        }
     }
 
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
         self
+    }
+
+    fn endpoint(&self, action: &str) -> String {
+        match &self.credential {
+            GeminiCredential::ApiKey(_) => {
+                format!("{PUBLIC_API_BASE}/{}:{action}", self.model)
+            }
+            GeminiCredential::Vertex {
+                project, location, ..
+            } => format!(
+                "{VERTEX_API_BASE}/projects/{project}/locations/{location}/publishers/google/models/{}:{action}",
+                self.model
+            ),
+        }
     }
 }
 
@@ -172,6 +268,16 @@ impl GeminiAgent {
                 "parts": parts.clone()
             }));
 
+            // Gemini 3.x emits at most one thoughtSignature per response,
+            // typically on the first part that has thinking attached. When
+            // the response contains multiple functionCall parts, every one
+            // of them must carry that signature on continuation. Find it
+            // once here and apply to every functionCall in this response.
+            let response_signature: Option<Value> = parts
+                .iter()
+                .filter_map(|p| p.get("thoughtSignature").cloned())
+                .find(|v| !v.is_null());
+
             let mut function_responses: Vec<Value> = Vec::new();
             let mut had_call = false;
 
@@ -186,18 +292,41 @@ impl GeminiAgent {
                 } else if let Some(call) = part.get("functionCall") {
                     had_call = true;
                     let name = call["name"].as_str().unwrap_or("").to_string();
-                    let args = call["args"].clone();
+                    // Pristine args for the actual tool invocation.
+                    let args_for_tool = call["args"].clone();
+                    // Gemini 3.x thinking models attach a `thoughtSignature`
+                    // to each functionCall *part*. The signature must be
+                    // replayed verbatim on continuation or the next request
+                    // is rejected. Stash it under a sentinel key inside the
+                    // recorded ToolCall.input so it round-trips through the
+                    // Forge graph. `prefix_to_contents` lifts it back to the
+                    // part level. The tool itself sees `args_for_tool` —
+                    // never the sentinel.
+                    let mut args_for_step = args_for_tool.clone();
+                    // Prefer a per-part signature if present; otherwise apply
+                    // the response-level signature so every functionCall in
+                    // this response is signed on continuation.
+                    let sig = part
+                        .get("thoughtSignature")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                        .or_else(|| response_signature.clone());
+                    if let Some(sig) = sig {
+                        if let Some(obj) = args_for_step.as_object_mut() {
+                            obj.insert(THOUGHT_SIGNATURE_KEY.to_string(), sig);
+                        }
+                    }
                     let call_id = format!("gemini-call-{turn}-{idx}");
                     self.call_names.insert(call_id.clone(), name.clone());
 
                     self.pending.push_back(StepKind::ToolCall {
                         call_id: call_id.clone(),
                         name: name.clone(),
-                        input: args.clone(),
+                        input: args_for_step,
                     });
 
                     let output = match self.tools.iter().find(|t| t.name() == name) {
-                        Some(tool) => match tool.run(&args).await {
+                        Some(tool) => match tool.run(&args_for_tool).await {
                             Ok(v) => v,
                             Err(e) => json!(e.to_string()),
                         },
@@ -262,17 +391,30 @@ impl GeminiAgent {
 
     fn auth_headers(&self) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-goog-api-key",
-            HeaderValue::from_str(&self.config.api_key)
-                .map_err(|_| anyhow::anyhow!("GEMINI_API_KEY contained invalid characters"))?,
-        );
+        match &self.config.credential {
+            GeminiCredential::ApiKey(key) => {
+                headers.insert(
+                    "x-goog-api-key",
+                    HeaderValue::from_str(key).map_err(|_| {
+                        anyhow::anyhow!("Gemini API key contained invalid characters")
+                    })?,
+                );
+            }
+            GeminiCredential::Vertex { access_token, .. } => {
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Bearer {access_token}")).map_err(|_| {
+                        anyhow::anyhow!("Vertex access token contained invalid characters")
+                    })?,
+                );
+            }
+        }
         headers.insert("content-type", HeaderValue::from_static("application/json"));
         Ok(headers)
     }
 
     async fn call_api(&self, history: &[Value]) -> anyhow::Result<Value> {
-        let url = format!("{API_BASE}/{}:generateContent", self.config.model);
+        let url = self.config.endpoint("generateContent");
         let req = self.build_request(history);
         let resp = self
             .client
@@ -296,10 +438,7 @@ impl GeminiAgent {
         use futures_util::StreamExt;
         use std::io::Write;
 
-        let url = format!(
-            "{API_BASE}/{}:streamGenerateContent?alt=sse",
-            self.config.model
-        );
+        let url = format!("{}?alt=sse", self.config.endpoint("streamGenerateContent"));
         let req = self.build_request(history);
         let mut headers = self.auth_headers()?;
         headers.insert("accept", HeaderValue::from_static("text/event-stream"));
@@ -431,15 +570,24 @@ pub fn prefix_to_contents(prefix: &[Step], call_names: &HashMap<String, String>)
                 let mapped = if role == "assistant" { "model" } else { "user" };
                 (mapped.to_string(), json!({"text": content}))
             }
-            StepKind::ToolCall { name, input, .. } => (
-                "model".to_string(),
-                json!({
+            StepKind::ToolCall { name, input, .. } => {
+                // Lift any stashed thoughtSignature out of args back to the
+                // part level, where Gemini expects it.
+                let mut args = input.clone();
+                let signature = args
+                    .as_object_mut()
+                    .and_then(|obj| obj.remove(THOUGHT_SIGNATURE_KEY));
+                let mut part = json!({
                     "functionCall": {
                         "name": name,
-                        "args": input
+                        "args": args
                     }
-                }),
-            ),
+                });
+                if let Some(sig) = signature {
+                    part["thoughtSignature"] = sig;
+                }
+                ("model".to_string(), part)
+            }
             StepKind::ToolResult { call_id, output } => {
                 let name = call_names
                     .get(call_id)
@@ -480,7 +628,7 @@ mod tests {
     fn tool_declarations_serialize_in_function_envelope() {
         let agent = GeminiAgent::new(
             GeminiConfig {
-                api_key: "x".into(),
+                credential: GeminiCredential::ApiKey("x".into()),
                 model: "gemini-2.5-flash".into(),
                 max_output_tokens: 1024,
                 system: None,
