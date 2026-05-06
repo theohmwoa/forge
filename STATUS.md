@@ -123,17 +123,6 @@ Ranked by likely value × cost.
    Smaller surface than direct API integration, but unlocks the
    "every Rust LLM project" audience.
 
-### High value, big cost
-9. **Tripwires** (the matcher trait stub already exists) — declarative
-   interception rules over streaming output. Auto-fork on hit.
-   The hard part isn't the runtime, it's the rule language.
-10. **Postgres `LISTEN/NOTIFY` for live `forge web`** — push new runs
-    to the browser instead of polling every 5s.
-11. **First-class Gemini adapter** — Google's API has a different
-    enough shape that it's a real port, not a tweak.
-12. **Web UI fork/continue actions** — wire the existing CLI verbs into
-    HTML buttons so non-CLI users can branch a run from the browser.
-    Requires careful auth (#7) before exposing.
 
 ### Production-readiness gaps
 - Multi-tenancy in `forge serve` (per-user runs, isolation).
@@ -142,10 +131,6 @@ Ranked by likely value × cost.
 - Rate limiting on the proxy.
 - Backpressure handling in the SSE tee for very long streams.
 
-### Definitely-not-yet
-- A SaaS/web app SPA. The whole project leans into "single binary,
-  cargo-installable, runs locally" — adding a real web app would
-  contradict that. The embedded `forge web` is sufficient.
 
 ## Known limits
 
