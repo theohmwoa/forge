@@ -759,6 +759,7 @@ dependencies = [
  "forge-anthropic",
  "forge-core",
  "forge-gemini",
+ "forge-mcp",
  "forge-openai",
  "forge-recorder",
  "forge-storage",
@@ -768,6 +769,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -798,6 +800,7 @@ dependencies = [
  "blake3",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]
@@ -813,6 +816,20 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "forge-mcp"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "forge-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -3180,6 +3197,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
