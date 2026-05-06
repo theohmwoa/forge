@@ -13,7 +13,11 @@ use forge::{
 };
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
-use forge_core::tool::{Calculator, Tool};
+use forge_core::tool::{
+    ApplyPatch, Calculator, CountLines, ListFiles, ReadFile, RunCommand, RunTests, SearchText,
+    Tool,
+};
+use forge_mcp::{mcp_tools_into_dyn, McpClient};
 use forge_core::{NodeHash, Step};
 use forge_gemini::{GeminiAgent, GeminiConfig};
 use forge_openai::{OpenAIAgent, OpenAIConfig};
@@ -73,6 +77,13 @@ enum Cmd {
         ///   --after-tool screenshot:gemini/gemini-2.5-flash
         #[arg(long, value_name = "TOOL:MODEL")]
         after_tool: Vec<String>,
+        /// Spawn one or more MCP servers and register every tool they
+        /// expose. Repeatable. Quote the whole command (with args) — Forge
+        /// splits on whitespace. Example:
+        ///   --mcp-server "uvx mcp-server-fetch"
+        ///   --mcp-server "npx -y @modelcontextprotocol/server-filesystem ."
+        #[arg(long, value_name = "CMD")]
+        mcp_server: Vec<String>,
     },
     /// Walk a recorded run from its head and print the chain.
     Replay { head: String },
@@ -175,6 +186,15 @@ enum Cmd {
         /// downgraded.
         #[arg(long, default_value = "claude-sonnet-4-6")]
         judge_model: String,
+        /// Tools to expose to the candidate replay. If empty, the inventory
+        /// is auto-detected per run from the recorded ToolCall steps in the
+        /// chain — typically what you want.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        tools: Vec<ToolKind>,
+        /// Cap on candidate-replay agent turns. Bump this when auditing
+        /// multi-tool agents so the replay can actually finish.
+        #[arg(long, default_value_t = 8)]
+        target_max_turns: usize,
     },
     /// Open a TUI viewer for a single run, or pass `--diff` to view aligned
     /// diff between two runs.
@@ -316,6 +336,13 @@ fn build_continuing_agent(
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum ToolKind {
     Calculator,
+    ListFiles,
+    ReadFile,
+    CountLines,
+    SearchText,
+    RunTests,
+    ApplyPatch,
+    RunCommand,
 }
 
 fn build_tools(kinds: &[ToolKind]) -> Vec<Arc<dyn Tool>> {
@@ -323,6 +350,33 @@ fn build_tools(kinds: &[ToolKind]) -> Vec<Arc<dyn Tool>> {
         .iter()
         .map(|k| match k {
             ToolKind::Calculator => Arc::new(Calculator) as Arc<dyn Tool>,
+            ToolKind::ListFiles => Arc::new(ListFiles) as Arc<dyn Tool>,
+            ToolKind::ReadFile => Arc::new(ReadFile) as Arc<dyn Tool>,
+            ToolKind::CountLines => Arc::new(CountLines) as Arc<dyn Tool>,
+            ToolKind::SearchText => Arc::new(SearchText) as Arc<dyn Tool>,
+            ToolKind::RunTests => Arc::new(RunTests) as Arc<dyn Tool>,
+            ToolKind::ApplyPatch => Arc::new(ApplyPatch) as Arc<dyn Tool>,
+            ToolKind::RunCommand => Arc::new(RunCommand::new()) as Arc<dyn Tool>,
+        })
+        .collect()
+}
+
+/// Resolve tool names from a recorded chain into the matching registered
+/// `Tool` implementations. Unknown names are silently dropped (the recorded
+/// agent might have used a tool that isn't compiled into this binary).
+fn resolve_tools_by_name(names: &[String]) -> Vec<Arc<dyn Tool>> {
+    names
+        .iter()
+        .filter_map(|n| match n.as_str() {
+            "calculator" => Some(Arc::new(Calculator) as Arc<dyn Tool>),
+            "list_files" => Some(Arc::new(ListFiles) as Arc<dyn Tool>),
+            "read_file" => Some(Arc::new(ReadFile) as Arc<dyn Tool>),
+            "count_lines" => Some(Arc::new(CountLines) as Arc<dyn Tool>),
+            "search_text" => Some(Arc::new(SearchText) as Arc<dyn Tool>),
+            "run_tests" => Some(Arc::new(RunTests) as Arc<dyn Tool>),
+            "apply_patch" => Some(Arc::new(ApplyPatch) as Arc<dyn Tool>),
+            "run_command" => Some(Arc::new(RunCommand::new()) as Arc<dyn Tool>),
+            _ => None,
         })
         .collect()
 }
@@ -357,8 +411,36 @@ async fn run() -> anyhow::Result<()> {
             stream,
             tag,
             after_tool,
+            mcp_server,
         } => {
-            let tool_set = build_tools(&tools);
+            let mut tool_set = build_tools(&tools);
+            // Spawn each MCP server, list its tools, append them to the
+            // inventory. Each Arc<McpClient> is held by every tool wrapped
+            // from that server, so the connection stays alive until the
+            // last tool is dropped.
+            let mut _mcp_clients: Vec<std::sync::Arc<McpClient>> = Vec::new();
+            for raw in &mcp_server {
+                let parts: Vec<&str> = raw.split_whitespace().collect();
+                if parts.is_empty() {
+                    anyhow::bail!("--mcp-server got an empty command");
+                }
+                let (cmd, args) = (parts[0], &parts[1..]);
+                tracing::info!(cmd = cmd, args = ?args, "spawning mcp server");
+                let client = McpClient::spawn(cmd, args)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("--mcp-server `{raw}` failed to start: {e}"))?;
+                let new_tools = mcp_tools_into_dyn(std::sync::Arc::clone(&client))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("--mcp-server `{raw}` tools/list failed: {e}"))?;
+                let names: Vec<String> = new_tools.iter().map(|t| t.name().to_string()).collect();
+                println!(
+                    "mcp `{cmd}` registered {} tool(s): {}",
+                    names.len(),
+                    names.join(", ")
+                );
+                tool_set.extend(new_tools);
+                _mcp_clients.push(client);
+            }
 
             let chain = if after_tool.is_empty() {
                 // Plain path: single model handles every turn (existing flow).
@@ -660,6 +742,8 @@ async fn run() -> anyhow::Result<()> {
             target_model,
             judge_agent,
             judge_model,
+            tools,
+            target_max_turns,
         } => {
             // Filter recorded runs by tag (if provided), apply limit.
             let mut runs = storage.list_runs().await?;
@@ -682,15 +766,30 @@ async fn run() -> anyhow::Result<()> {
 
             // Build closures that produce a fresh agent on each call. We
             // capture by clone so each replay is independent.
+            //
+            // The candidate replay needs the same tool inventory the original
+            // run used, otherwise tool-using agents produce empty answers and
+            // the judge correctly says "different" — for the wrong reason.
+            // We auto-detect from the recorded chain (each call to the factory
+            // gets the chain's tool names) but `--tools` overrides the auto.
             let ta = target_agent;
             let tm = target_model.clone();
-            let build_target = move |prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+            let max_turns = target_max_turns;
+            let explicit_tools = tools.clone();
+            let build_target = move |prompt: &str,
+                                     tool_names: &[String]|
+                  -> anyhow::Result<Box<dyn Agent>> {
+                let resolved_tools = if !explicit_tools.is_empty() {
+                    build_tools(&explicit_tools)
+                } else {
+                    resolve_tools_by_name(tool_names)
+                };
                 build_fresh_agent(
                     ta,
                     Some(prompt.to_string()),
                     tm.clone(),
-                    Vec::new(),
-                    Some(2),
+                    resolved_tools,
+                    Some(max_turns),
                     false,
                 )
             };
