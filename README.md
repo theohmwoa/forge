@@ -36,6 +36,39 @@ auditing 52 run(s) against claude-haiku-4-5
 
 `forge audit` measures per-prompt downgrade safety against your real recorded runs, with an LLM judge. The audit and the routing close the loop: measure → derive rules → apply.
 
+## Cheap by default, smart only where it matters
+
+Routing isn't *only* cost arbitrage. Sometimes the cheap model genuinely fails the task — and routing rescues it with a single flag.
+
+A planted-bug fixture lives at `tests/fixtures/buggy/`: `multiply(a, b) -> a + b` instead of `a * b`. Three unit tests pin it down. The agent gets three tools: `run_tests`, `read_file`, `apply_patch`.
+
+**Pure `gemini-2.5-flash-lite`, no routing.** The agent calls `run_tests`, sees cargo's `test result: FAILED. 1 failed; 2 passed`, and replies:
+
+> *"The crate already passes all tests. There is no bug to fix."*
+
+The cheap model hallucinates success in direct contradiction of the structured tool output. No patch applied. Tests still failing.
+
+**Same agent, same prompt, same tools — one flag added:**
+
+```bash
+$ forge run --agent gemini --model gemini-2.5-flash-lite \
+    --tools run-tests,read-file,apply-patch \
+    --after-tool run_tests:gemini-2.5-flash \
+    --after-tool read_file:gemini-2.5-flash \
+    --prompt "..."
+
+routed run: 5 cycle(s)
+  cycle 0  [after run_tests  ]  flash-lite  +3 step(s)   ← cheap: ran the failing tests
+  cycle 1  [after read_file  ]  flash       +2 step(s)   ← smart: read the source
+  cycle 2  [after apply_patch]  flash       +2 step(s)   ← smart: applied a + b → a * b
+  cycle 3  [after run_tests  ]  flash-lite  +2 step(s)   ← cheap: re-ran tests
+  cycle 4  [after run_tests  ]  flash       +1 step      ← smart: synthesized FIXED
+```
+
+Final assistant message: `FIXED`. `cargo test` independently confirms `3 passed; 0 failed`. The fix the agent applied is in the chain — `apply_patch(old="a + b", new="a * b")`. Reproducible end-to-end on a real codebase, not synthetic.
+
+The smart model only handled the two cycles where *structured interpretation matters* (read_file → understand source, run_tests → diagnose failure). Mechanical iteration stayed on the cheap model. Same agent loop. One config flag.
+
 ## What it is
 
 Every agent execution is a DAG of content-addressed steps. Each step (prompt, tool call, response, sandbox run) is a hash-keyed node. The graph is the source of truth.
@@ -56,19 +89,21 @@ Forge treats agent runs the way `git` treats source code: a commit graph you can
 
 ## Architecture
 
-Cargo workspace, three crates:
+Cargo workspace:
 
 | crate | what it owns |
 |---|---|
-| `forge-core` | step types, hashes, graph invariants, `Agent` / `Matcher` / `Tool` traits |
-| `forge-storage` | `Storage` trait, `MemoryStorage`, `SledStorage` |
-| `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use, prompt caching) |
-| `forge-openai` | OpenAI Chat Completions adapter (multi-turn tool use) |
-| `forge-gemini` | Google Gemini `generateContent` adapter (multi-turn function calling) |
+| `forge-core` | step types, hashes, graph invariants, `Agent` / `Matcher` / `Tool` traits + the built-in tool library (calculator, fs ops, run_tests, apply_patch, run_command) |
+| `forge-storage` | `Storage` trait — `MemoryStorage`, `SledStorage`, `PostgresStorage` |
+| `forge-anthropic` | Anthropic Messages API adapter (multi-turn tool use, prompt caching, SSE streaming) |
+| `forge-openai` | OpenAI Chat Completions adapter (multi-turn tool use, SSE streaming) |
+| `forge-gemini` | Google Gemini adapter — public API + Vertex AI bearer auth + Gemini 3.x thinking-mode tool continuations |
+| `forge-mcp` | Model Context Protocol JSON-RPC client + `Tool` adapter — drop in any MCP server's tools as native Forge tools |
 | `forge-rig` | Record a [Rig](https://rig.rs) conversation as a Forge step chain |
-| `forge-cli` | the `forge` binary (`run`, `runs`, `replay`, `continue`, `fork`, `diff`) |
+| `forge-recorder` | HTTP recorder proxy (Anthropic + OpenAI, auto-threaded via content-addressed prefix detection) |
+| `forge-cli` | the `forge` binary (`run`, `runs`, `replay`, `continue`, `fork`, `diff`, `bisect`, `audit`, `view`, `serve`, `web`) |
 
-Storage backends planned: in-memory (done), sled, Postgres (single source of truth, durable resume).
+Storage backends: in-memory (tests), sled (default, single-process), Postgres (multi-process / multi-machine, durable resume, `LISTEN/NOTIFY` for live web updates).
 
 ## Roadmap
 
@@ -147,6 +182,24 @@ forge run --agent openai --model gpt-5 --tools calculator --prompt "what is 47 *
 # Gemini, ditto
 export GEMINI_API_KEY=...
 forge run --agent gemini --model gemini-2.5-flash --tools calculator --prompt "what is 47 * 53?"
+
+# Vertex AI (bearer auth via gcloud ADC) — same flags, different env
+export FORGE_VERTEX=1 FORGE_VERTEX_PROJECT=my-gcp-project
+export GOOGLE_VERTEX_ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
+forge run --agent gemini --model gemini-3.1-pro-preview --tools calculator --prompt "..."
+
+# point forge at any MCP server; its tools register automatically
+# (alongside built-in tools — no Rust changes needed)
+forge run --agent anthropic \
+    --mcp-server "npx -y @modelcontextprotocol/server-filesystem ." \
+    --prompt "..."
+
+# autonomous bug-hunting on the planted-bug fixture — see top of README
+forge run --agent gemini --model gemini-2.5-flash-lite \
+    --tools run-tests,read-file,apply-patch \
+    --after-tool run_tests:gemini-2.5-flash \
+    --after-tool read_file:gemini-2.5-flash \
+    --prompt "Run tests on tests/fixtures/buggy. If any fail, find the bug, apply_patch it, re-run. Output FIXED or BROKEN."
 
 # list recorded runs
 forge runs
@@ -245,4 +298,4 @@ legend: =  same   ~  modified   -  only in A   +  only in B
 
 ## License
 
-Dual-licensed under [MIT](LICENSE-MIT) and [Apache-2.0](LICENSE-APACHE), at your option.
+[MIT](LICENSE).
