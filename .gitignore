@@ -1,4 +1,6 @@
 /target
+**/target/
+tests/fixtures/*/Cargo.lock
 **/*.rs.bk
 .DS_Store
 *.log
