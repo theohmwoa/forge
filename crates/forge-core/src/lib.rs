@@ -39,8 +39,16 @@ impl Step {
     /// Compute the content-addressed id for a step, derived from its parent
     /// and kind. Timestamp is intentionally excluded so logically-identical
     /// continuations of the same prefix collapse to the same node.
+    ///
+    /// Object keys with the `__forge_` prefix inside `ToolCall.input` and
+    /// `ToolResult.output` are filtered out before hashing. These are reserved
+    /// for provider-side artifacts (e.g. Gemini's `thoughtSignature`) that
+    /// vary per-run but don't affect the logical identity of the step. The
+    /// stored `kind` retains the sentinels so they can be replayed verbatim
+    /// when continuing the conversation.
     pub fn compute_id(parent: &Option<NodeHash>, kind: &StepKind) -> NodeHash {
-        let payload = serde_json::to_vec(&(parent, kind))
+        let canonical = canonicalize_kind_for_hash(kind);
+        let payload = serde_json::to_vec(&(parent, canonical))
             .expect("step kinds and node hashes are always serializable");
         NodeHash::of_bytes(&payload)
     }
@@ -76,6 +84,56 @@ pub enum StepKind {
         call_id: String,
         output: serde_json::Value,
     },
+}
+
+/// Sentinel-key prefix reserved for provider-side artifacts inside ToolCall
+/// inputs / ToolResult outputs (e.g. `__forge_gemini_thought_signature`).
+/// Stripped from the value used for content-addressed hashing.
+pub const FORGE_INTERNAL_KEY_PREFIX: &str = "__forge_";
+
+/// Walk a `Value` and strip any object keys starting with [`FORGE_INTERNAL_KEY_PREFIX`].
+fn strip_internal_keys(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.retain(|k, _| !k.starts_with(FORGE_INTERNAL_KEY_PREFIX));
+            for child in map.values_mut() {
+                strip_internal_keys(child);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                strip_internal_keys(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn canonicalize_kind_for_hash(kind: &StepKind) -> StepKind {
+    match kind {
+        StepKind::ToolCall {
+            call_id,
+            name,
+            input,
+        } => {
+            let mut input = input.clone();
+            strip_internal_keys(&mut input);
+            StepKind::ToolCall {
+                call_id: call_id.clone(),
+                name: name.clone(),
+                input,
+            }
+        }
+        StepKind::ToolResult { call_id, output } => {
+            let mut output = output.clone();
+            strip_internal_keys(&mut output);
+            StepKind::ToolResult {
+                call_id: call_id.clone(),
+                output,
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -114,6 +172,57 @@ mod tests {
         let a = Step::new(None, kind.clone(), 0);
         let b = Step::new(Some(NodeHash::of_bytes(b"prev")), kind, 0);
         assert_ne!(a.id, b.id);
+    }
+
+    #[test]
+    fn step_id_strips_forge_internal_keys_from_tool_call_input() {
+        // Two ToolCall steps logically identical except for a provider-side
+        // artifact under a __forge_ key — should hash equal so that runs
+        // with different per-session signatures still align.
+        let parent = Some(NodeHash::of_bytes(b"shared-parent"));
+        let a = Step::new(
+            parent.clone(),
+            StepKind::ToolCall {
+                call_id: "c1".into(),
+                name: "list_files".into(),
+                input: serde_json::json!({"path": ".", "__forge_gemini_thought_signature": "sigA"}),
+            },
+            0,
+        );
+        let b = Step::new(
+            parent,
+            StepKind::ToolCall {
+                call_id: "c1".into(),
+                name: "list_files".into(),
+                input: serde_json::json!({"path": ".", "__forge_gemini_thought_signature": "sigB"}),
+            },
+            0,
+        );
+        assert_eq!(a.id, b.id, "internal-key differences must not affect hash");
+    }
+
+    #[test]
+    fn step_id_still_changes_with_logical_input_change() {
+        let parent = Some(NodeHash::of_bytes(b"shared-parent"));
+        let a = Step::new(
+            parent.clone(),
+            StepKind::ToolCall {
+                call_id: "c1".into(),
+                name: "list_files".into(),
+                input: serde_json::json!({"path": "."}),
+            },
+            0,
+        );
+        let b = Step::new(
+            parent,
+            StepKind::ToolCall {
+                call_id: "c1".into(),
+                name: "list_files".into(),
+                input: serde_json::json!({"path": "/tmp"}),
+            },
+            0,
+        );
+        assert_ne!(a.id, b.id, "user-visible input must affect hash");
     }
 
     #[test]
