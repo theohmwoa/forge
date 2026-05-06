@@ -12,9 +12,7 @@ use std::sync::Arc;
 use forge_core::tool::Tool;
 use forge_mcp::{mcp_tools_into_dyn, McpClient};
 use serde_json::{json, Value};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Spawn the fake server task. Returns a join handle that completes when the
 /// server's read side hits EOF (i.e. the client dropped). The server treats
@@ -258,12 +256,8 @@ async fn concurrent_requests_dispatch_to_correct_pending_oneshot() {
     let c1 = Arc::clone(&client);
     let c2 = Arc::clone(&client);
 
-    let f1 = tokio::spawn(async move {
-        c1.call_tool("echo", json!({ "message": "one" })).await
-    });
-    let f2 = tokio::spawn(async move {
-        c2.call_tool("sum", json!({ "a": 10, "b": 20 })).await
-    });
+    let f1 = tokio::spawn(async move { c1.call_tool("echo", json!({ "message": "one" })).await });
+    let f2 = tokio::spawn(async move { c2.call_tool("sum", json!({ "a": 10, "b": 20 })).await });
     let (r1, r2) = tokio::join!(f1, f2);
     assert_eq!(r1.unwrap().unwrap(), Value::String("one".into()));
     assert_eq!(r2.unwrap().unwrap(), Value::String("30".into()));
@@ -329,9 +323,7 @@ async fn mcp_tools_drop_into_forge_tool_trait() {
     // every discovered tool can be invoked through the trait without the
     // caller ever knowing it came from MCP.
     let (client, _server) = connect_fake().await;
-    let tools: Vec<Arc<dyn Tool>> = mcp_tools_into_dyn(Arc::clone(&client))
-        .await
-        .unwrap();
+    let tools: Vec<Arc<dyn Tool>> = mcp_tools_into_dyn(Arc::clone(&client)).await.unwrap();
     assert_eq!(tools.len(), 3);
 
     let echo = tools.iter().find(|t| t.name() == "echo").unwrap();

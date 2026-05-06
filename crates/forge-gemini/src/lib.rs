@@ -94,7 +94,9 @@ impl GeminiConfig {
             let project = std::env::var("FORGE_VERTEX_PROJECT")
                 .or_else(|_| std::env::var("GOOGLE_CLOUD_PROJECT"))
                 .map_err(|_| {
-                    anyhow::anyhow!("FORGE_VERTEX=1 requires FORGE_VERTEX_PROJECT (or GOOGLE_CLOUD_PROJECT)")
+                    anyhow::anyhow!(
+                        "FORGE_VERTEX=1 requires FORGE_VERTEX_PROJECT (or GOOGLE_CLOUD_PROJECT)"
+                    )
                 })?;
             let location =
                 std::env::var("FORGE_VERTEX_LOCATION").unwrap_or_else(|_| "global".to_string());

@@ -20,9 +20,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader,
-};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, Mutex};
 
@@ -287,10 +285,7 @@ impl Drop for McpClient {
 
 /// Background loop that parses one JSON-RPC envelope per line and dispatches
 /// responses to their pending oneshot channels.
-async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(
-    reader: R,
-    pending: PendingMap,
-) {
+async fn reader_loop<R: AsyncRead + Unpin + Send + 'static>(reader: R, pending: PendingMap) {
     let mut buf = BufReader::new(reader);
     let mut line = String::new();
     loop {

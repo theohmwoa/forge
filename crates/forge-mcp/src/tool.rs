@@ -50,9 +50,7 @@ impl Tool for McpTool {
 /// Convenience: list every tool the client exposes and box each into
 /// `Arc<dyn Tool>` so the result is drop-in for `with_tools(...)` on an
 /// existing Forge agent.
-pub async fn mcp_tools_into_dyn(
-    client: Arc<McpClient>,
-) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
+pub async fn mcp_tools_into_dyn(client: Arc<McpClient>) -> anyhow::Result<Vec<Arc<dyn Tool>>> {
     let descriptors = client.list_tools().await?;
     Ok(descriptors
         .into_iter()

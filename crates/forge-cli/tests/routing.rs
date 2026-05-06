@@ -238,7 +238,9 @@ async fn router_picks_the_most_recent_tool_when_multiple_appear_in_one_cycle() {
         t.lock().unwrap().push(target.clone());
         Ok(c.lock().unwrap().pop_front().unwrap())
     };
-    let _ = run_routed(&storage, default, &rules, 8, factory).await.unwrap();
+    let _ = run_routed(&storage, default, &rules, 8, factory)
+        .await
+        .unwrap();
     let targets = targets_log.lock().unwrap().clone();
     // Cycle 1 should have routed on the most-recent tool (count_lines).
     assert_eq!(

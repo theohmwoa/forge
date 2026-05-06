@@ -154,8 +154,8 @@ impl Tool for ReadFile {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("read_file: missing path"))?;
         let max = input["max_bytes"].as_u64().unwrap_or(65_536) as usize;
-        let bytes = std::fs::read(path)
-            .map_err(|err| anyhow::anyhow!("read_file: read({path}): {err}"))?;
+        let bytes =
+            std::fs::read(path).map_err(|err| anyhow::anyhow!("read_file: read({path}): {err}"))?;
         let truncated = bytes.len() > max;
         let take = bytes.len().min(max);
         let content = String::from_utf8_lossy(&bytes[..take]).to_string();

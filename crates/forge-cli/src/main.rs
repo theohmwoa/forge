@@ -14,12 +14,11 @@ use forge::{
 use forge_anthropic::{AnthropicAgent, AnthropicConfig};
 use forge_core::agent::{Agent, FakeAgent};
 use forge_core::tool::{
-    ApplyPatch, Calculator, CountLines, ListFiles, ReadFile, RunCommand, RunTests, SearchText,
-    Tool,
+    ApplyPatch, Calculator, CountLines, ListFiles, ReadFile, RunCommand, RunTests, SearchText, Tool,
 };
-use forge_mcp::{mcp_tools_into_dyn, McpClient};
 use forge_core::{NodeHash, Step};
 use forge_gemini::{GeminiAgent, GeminiConfig};
+use forge_mcp::{mcp_tools_into_dyn, McpClient};
 use forge_openai::{OpenAIAgent, OpenAIConfig};
 use forge_storage::{PostgresStorage, RunMeta, SledStorage, Storage};
 
@@ -776,23 +775,22 @@ async fn run() -> anyhow::Result<()> {
             let tm = target_model.clone();
             let max_turns = target_max_turns;
             let explicit_tools = tools.clone();
-            let build_target = move |prompt: &str,
-                                     tool_names: &[String]|
-                  -> anyhow::Result<Box<dyn Agent>> {
-                let resolved_tools = if !explicit_tools.is_empty() {
-                    build_tools(&explicit_tools)
-                } else {
-                    resolve_tools_by_name(tool_names)
+            let build_target =
+                move |prompt: &str, tool_names: &[String]| -> anyhow::Result<Box<dyn Agent>> {
+                    let resolved_tools = if !explicit_tools.is_empty() {
+                        build_tools(&explicit_tools)
+                    } else {
+                        resolve_tools_by_name(tool_names)
+                    };
+                    build_fresh_agent(
+                        ta,
+                        Some(prompt.to_string()),
+                        tm.clone(),
+                        resolved_tools,
+                        Some(max_turns),
+                        false,
+                    )
                 };
-                build_fresh_agent(
-                    ta,
-                    Some(prompt.to_string()),
-                    tm.clone(),
-                    resolved_tools,
-                    Some(max_turns),
-                    false,
-                )
-            };
             let ja = judge_agent;
             let jm = judge_model.clone();
             let build_judge = move |prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
