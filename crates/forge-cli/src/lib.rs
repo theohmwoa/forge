@@ -724,15 +724,22 @@ pub async fn audit_run<S, BuildTarget, BuildJudge>(
 ) -> anyhow::Result<Option<AuditOutcome>>
 where
     S: Storage + ?Sized,
-    BuildTarget: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+    BuildTarget: FnMut(&str, &[String]) -> anyhow::Result<Box<dyn Agent>>,
     BuildJudge: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
 {
     let Some((original_prompt, original_answer)) = extract_audit_pair(chain) else {
         return Ok(None);
     };
 
-    // 1) Run the cheaper model on the same prompt.
-    let mut target = build_target(&original_prompt)?;
+    // The original chain shows which tools the agent had access to. Pass that
+    // signal to the target factory so the replay isn't crippled by a missing
+    // tool inventory — without this, audits of tool-using agents always
+    // judge "different" because the candidate has no tools and produces an
+    // empty answer.
+    let tool_names = collect_tool_names(chain);
+
+    // 1) Run the cheaper model on the same prompt with the same tools.
+    let mut target = build_target(&original_prompt, &tool_names)?;
     let candidate_chain = run_agent(target.as_mut(), storage).await?;
     if candidate_chain.is_empty() {
         anyhow::bail!("audit: candidate model produced no steps");
@@ -820,7 +827,7 @@ pub async fn audit_runs<S, BuildTarget, BuildJudge>(
 ) -> anyhow::Result<AuditSummary>
 where
     S: Storage + ?Sized,
-    BuildTarget: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
+    BuildTarget: FnMut(&str, &[String]) -> anyhow::Result<Box<dyn Agent>>,
     BuildJudge: FnMut(&str) -> anyhow::Result<Box<dyn Agent>>,
 {
     let mut summary = AuditSummary::default();
@@ -861,6 +868,22 @@ where
         }
     }
     Ok(summary)
+}
+
+/// Collect the (deduplicated, sorted) set of tool names that appear in a
+/// recorded chain. Used by `audit_run` to preserve the original tool
+/// inventory when replaying against a candidate model.
+pub fn collect_tool_names(chain: &[Step]) -> Vec<String> {
+    let mut names: Vec<String> = chain
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StepKind::ToolCall { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The judge prompt is the load-bearing piece. Designed to be tight and to
@@ -1731,7 +1754,7 @@ mod tests {
         let head = chain.last().unwrap().id.clone();
 
         // Target (cheap model) gives an equivalent answer.
-        let target_builder = |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+        let target_builder = |_prompt: &str, _tools: &[String]| -> anyhow::Result<Box<dyn Agent>> {
             Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| {
                 "Paris is the capital.".into()
             })) as Box<dyn Agent>)
@@ -1800,7 +1823,7 @@ mod tests {
         .id
         .clone();
 
-        let target_builder = |_prompt: &str| -> anyhow::Result<Box<dyn Agent>> {
+        let target_builder = |_prompt: &str, _tools: &[String]| -> anyhow::Result<Box<dyn Agent>> {
             Ok(Box::new(ScriptedAgent::new(Vec::new(), |_| {
                 "candidate answer".into()
             })) as Box<dyn Agent>)
