@@ -21,7 +21,29 @@
 //!    workflow" produce the same cloud-view bytes for the shared prefix?
 //!    This drives long-term cache hit rate.
 //!
-//! See `tests` for the empirical comparison of the four policies.
+//! Three step kinds get redacted when the policy demands it:
+//!
+//! - `ToolResult.output` — the obvious one. The tool's payload is the
+//!   primary leak path.
+//! - `ToolCall.input` — the agent might have passed PII as a tool argument
+//!   (`lookup_address(name="Jane Doe", ssn="...")`). Redacted only for the
+//!   *sensitive* tool's call, not for non-sensitive tools elsewhere in the
+//!   chain.
+//! - `Message.content` *(role=assistant)* when the message is in a
+//!   "sensitive context" — i.e. comes anywhere after a sensitive
+//!   `ToolResult` in the chain. The trusted model might have echoed the
+//!   PII into its own response while reasoning about it. Conservative by
+//!   design: every assistant message after a sensitive tool result gets
+//!   redacted, regardless of whether it actually quotes PII. Apps that
+//!   need to preserve a sanitized summary should send that summary as a
+//!   non-`assistant` role (e.g. `summary`) which is left untouched.
+//!
+//! `Prompt.content` and `Message.content` for non-assistant roles are
+//! never touched. The original user prompt is structural; rewriting it
+//! would corrupt the run.
+//!
+//! See `tests` for the empirical comparison of the four policies across
+//! all three step kinds.
 
 use std::collections::HashSet;
 
@@ -67,66 +89,130 @@ pub fn cloud_view(
     policy: &RedactionPolicy,
     sensitive_tools: &HashSet<String>,
 ) -> Vec<Step> {
+    if matches!(policy, RedactionPolicy::None) {
+        return chain.to_vec();
+    }
+
+    // First pass: identify which assistant messages are in a "sensitive
+    // context" — i.e. anywhere after the first sensitive `ToolResult` in
+    // the chain. Once exposed, every subsequent assistant message is a
+    // potential PII leak path.
+    let mut sensitive_seen = false;
+    let mut tainted_messages: HashSet<usize> = HashSet::new();
+    for (i, step) in chain.iter().enumerate() {
+        if matches!(&step.kind, StepKind::ToolResult { .. })
+            && is_sensitive_result(chain, &step.id, sensitive_tools)
+        {
+            sensitive_seen = true;
+            continue;
+        }
+        if sensitive_seen {
+            if let StepKind::Message { role, .. } = &step.kind {
+                if role == "assistant" {
+                    tainted_messages.insert(i);
+                }
+            }
+        }
+    }
+
     chain
         .iter()
-        .map(|step| match (&policy, &step.kind) {
-            (RedactionPolicy::None, _) => step.clone(),
-
-            (
-                RedactionPolicy::ReplaceFixed { marker },
-                StepKind::ToolResult { call_id, output },
-            ) if is_sensitive_result(chain, &step.id, sensitive_tools) => {
-                let _ = output;
-                Step {
-                    id: step.id.clone(),
-                    parent: step.parent.clone(),
-                    kind: StepKind::ToolResult {
-                        call_id: call_id.clone(),
-                        output: Value::String(marker.clone()),
-                    },
-                    timestamp_ms: step.timestamp_ms,
-                }
+        .enumerate()
+        .map(|(i, step)| match &step.kind {
+            StepKind::ToolCall {
+                call_id,
+                name,
+                input,
+            } if sensitive_tools.contains(name) => {
+                redact_tool_call_input(step, call_id, name, input, policy)
             }
-
-            (RedactionPolicy::PublicPayload, StepKind::ToolResult { call_id, output })
+            StepKind::ToolResult { call_id, output }
                 if is_sensitive_result(chain, &step.id, sensitive_tools) =>
             {
-                let public = match output.as_object() {
-                    Some(obj) => obj
-                        .get("public")
-                        .cloned()
-                        .unwrap_or_else(|| json!("[redacted: tool returned no public payload]")),
-                    None => json!("[redacted: tool output not an object]"),
-                };
-                Step {
-                    id: step.id.clone(),
-                    parent: step.parent.clone(),
-                    kind: StepKind::ToolResult {
-                        call_id: call_id.clone(),
-                        output: public,
-                    },
-                    timestamp_ms: step.timestamp_ms,
-                }
+                redact_tool_result_output(step, call_id, output, policy)
             }
-
-            (RedactionPolicy::Memo { memo }, StepKind::ToolResult { call_id, output })
-                if is_sensitive_result(chain, &step.id, sensitive_tools) =>
+            StepKind::Message { role, content }
+                if role == "assistant" && tainted_messages.contains(&i) =>
             {
-                let _ = output;
-                Step {
-                    id: step.id.clone(),
-                    parent: step.parent.clone(),
-                    kind: StepKind::ToolResult {
-                        call_id: call_id.clone(),
-                        output: Value::String(memo.clone()),
-                    },
-                    timestamp_ms: step.timestamp_ms,
-                }
+                redact_assistant_message(step, role, content, policy)
             }
-
             _ => step.clone(),
         })
         .collect()
+}
+
+fn redact_value(input: &Value, policy: &RedactionPolicy, label: &str) -> Value {
+    match policy {
+        RedactionPolicy::None => input.clone(),
+        RedactionPolicy::ReplaceFixed { marker } => Value::String(marker.clone()),
+        RedactionPolicy::PublicPayload => match input.as_object() {
+            Some(obj) => obj
+                .get("public")
+                .cloned()
+                .unwrap_or_else(|| json!(format!("[redacted: no public {label} payload]"))),
+            None => json!(format!("[redacted: {label} not an object]")),
+        },
+        RedactionPolicy::Memo { memo } => Value::String(memo.clone()),
+    }
+}
+
+fn redact_tool_call_input(
+    step: &Step,
+    call_id: &str,
+    name: &str,
+    input: &Value,
+    policy: &RedactionPolicy,
+) -> Step {
+    Step {
+        id: step.id.clone(),
+        parent: step.parent.clone(),
+        kind: StepKind::ToolCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: redact_value(input, policy, "input"),
+        },
+        timestamp_ms: step.timestamp_ms,
+    }
+}
+
+fn redact_tool_result_output(
+    step: &Step,
+    call_id: &str,
+    output: &Value,
+    policy: &RedactionPolicy,
+) -> Step {
+    Step {
+        id: step.id.clone(),
+        parent: step.parent.clone(),
+        kind: StepKind::ToolResult {
+            call_id: call_id.to_string(),
+            output: redact_value(output, policy, "output"),
+        },
+        timestamp_ms: step.timestamp_ms,
+    }
+}
+
+fn redact_assistant_message(
+    step: &Step,
+    role: &str,
+    _content: &str,
+    policy: &RedactionPolicy,
+) -> Step {
+    let new_content = match policy {
+        RedactionPolicy::None => unreachable!("None handled at the top of cloud_view"),
+        RedactionPolicy::ReplaceFixed { marker } => marker.clone(),
+        RedactionPolicy::PublicPayload => "[redacted assistant message]".to_string(),
+        RedactionPolicy::Memo { memo } => memo.clone(),
+    };
+    Step {
+        id: step.id.clone(),
+        parent: step.parent.clone(),
+        kind: StepKind::Message {
+            role: role.to_string(),
+            content: new_content,
+        },
+        timestamp_ms: step.timestamp_ms,
+    }
 }
 
 /// A `ToolResult` step is "sensitive" if its preceding `ToolCall` step in
@@ -473,6 +559,301 @@ mod tests {
         assert_ne!(
             v1, v2,
             "Memo content drives the cache key — LLM-sampled memos break cross-run caching"
+        );
+    }
+
+    // ---- ToolCall.input redaction ----------------------------------------
+
+    /// Build a chain where the agent passes PII as a tool argument.
+    /// e.g. `lookup_address(name="Jane", ssn="...")`.
+    fn chain_with_pii_in_tool_input(input: Value, output: Value) -> Vec<Step> {
+        let s0 = step(
+            None,
+            StepKind::Prompt {
+                model: "test-cloud".into(),
+                content: "Look up an address.".into(),
+            },
+        );
+        let s1 = step(
+            Some(s0.id.clone()),
+            StepKind::ToolCall {
+                call_id: "c-1".into(),
+                name: "lookup_customer".into(),
+                input,
+            },
+        );
+        let s2 = step(
+            Some(s1.id.clone()),
+            StepKind::ToolResult {
+                call_id: "c-1".into(),
+                output,
+            },
+        );
+        vec![s0, s1, s2]
+    }
+
+    #[test]
+    fn replace_fixed_redacts_pii_in_tool_call_input() {
+        let pii = "SSN-111-22-3333";
+        let chain = chain_with_pii_in_tool_input(
+            json!({ "ssn": pii, "name": "Jane Doe" }),
+            json!({ "address": "1 Main" }),
+        );
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::ReplaceFixed {
+                marker: "[REDACTED]".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        assert!(
+            !contains(&s, pii),
+            "SSN must not flow through ToolCall.input"
+        );
+        assert!(
+            !contains(&s, "Jane Doe"),
+            "name in input must also be redacted"
+        );
+        assert!(
+            !contains(&s, "1 Main"),
+            "output redaction (existing behavior) must still hold"
+        );
+    }
+
+    #[test]
+    fn non_sensitive_tool_input_is_not_touched() {
+        // Mixed chain: a non-sensitive tool that shouldn't get its input
+        // touched, plus a sensitive one that should.
+        let s0 = step(
+            None,
+            StepKind::Prompt {
+                model: "m".into(),
+                content: "go".into(),
+            },
+        );
+        let s1 = step(
+            Some(s0.id.clone()),
+            StepKind::ToolCall {
+                call_id: "c-pub".into(),
+                name: "list_files".into(),
+                input: json!({ "path": "/etc/passwd" }),
+            },
+        );
+        let s2 = step(
+            Some(s1.id.clone()),
+            StepKind::ToolResult {
+                call_id: "c-pub".into(),
+                output: json!(["a", "b"]),
+            },
+        );
+        let s3 = step(
+            Some(s2.id.clone()),
+            StepKind::ToolCall {
+                call_id: "c-priv".into(),
+                name: "lookup_customer".into(),
+                input: json!({ "ssn": "111-22-3333" }),
+            },
+        );
+        let s4 = step(
+            Some(s3.id.clone()),
+            StepKind::ToolResult {
+                call_id: "c-priv".into(),
+                output: json!({ "addr": "secret" }),
+            },
+        );
+        let chain = vec![s0, s1, s2, s3, s4];
+
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::ReplaceFixed {
+                marker: "[REDACTED]".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        // Non-sensitive tool's input survives.
+        assert!(contains(&s, "/etc/passwd"));
+        assert!(contains(&s, "list_files"));
+        // Sensitive tool's input is redacted.
+        assert!(!contains(&s, "111-22-3333"));
+        // Sensitive tool's output is also redacted (existing behavior).
+        assert!(!contains(&s, "secret"));
+    }
+
+    #[test]
+    fn public_payload_keeps_public_field_in_tool_call_input() {
+        let chain = chain_with_pii_in_tool_input(
+            json!({ "public": "lookup-customer-42", "private": "ssn-AAA-111" }),
+            json!({ "public": "tier-A", "private": "secret-payload-zzz" }),
+        );
+        let view = cloud_view(&chain, &RedactionPolicy::PublicPayload, &sensitive());
+        let s = serialize(&view);
+        assert!(!contains(&s, "ssn-AAA-111"));
+        assert!(!contains(&s, "secret-payload-zzz"));
+        assert!(contains(&s, "lookup-customer-42"));
+        assert!(contains(&s, "tier-A"));
+    }
+
+    #[test]
+    fn memo_replaces_tool_call_input() {
+        let chain = chain_with_pii_in_tool_input(
+            json!({ "ssn": "111-22-3333" }),
+            json!({ "addr": "secret" }),
+        );
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::Memo {
+                memo: "Customer lookup performed.".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        assert!(!contains(&s, "111-22-3333"));
+        assert!(!contains(&s, "secret"));
+        assert!(contains(&s, "Customer lookup performed."));
+    }
+
+    // ---- Assistant message redaction in sensitive context ------------------
+
+    /// Like `chain_with_pii` but the post-tool-result assistant message
+    /// also echoes the PII (modeling a local model that summarized the
+    /// record back into its own response).
+    fn chain_with_pii_echoed_in_message(pii: &str) -> Vec<Step> {
+        let mut chain = chain_with_pii(json!({ "ssn": pii }));
+        // The trailing assistant message in `chain_with_pii` doesn't contain
+        // the PII; replace it with one that does.
+        let last = chain.pop().unwrap();
+        let parent = last.parent.clone();
+        chain.push(step(
+            parent,
+            StepKind::Message {
+                role: "assistant".into(),
+                content: format!("Got the customer record. SSN is {pii}, proceeding."),
+            },
+        ));
+        chain
+    }
+
+    #[test]
+    fn assistant_message_after_sensitive_tool_result_is_redacted() {
+        let pii = "SSN-111-22-3333";
+        let chain = chain_with_pii_echoed_in_message(pii);
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::ReplaceFixed {
+                marker: "[REDACTED]".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        assert!(
+            !contains(&s, pii),
+            "PII echoed by the model into its own message must not flow to the cloud"
+        );
+        // The original assistant content "Got the customer record..." should
+        // also be gone; it's replaced wholesale.
+        assert!(!contains(&s, "Got the customer record"));
+    }
+
+    #[test]
+    fn assistant_message_before_any_sensitive_tool_is_left_alone() {
+        // First assistant message in chain_with_pii is "I'll look them up.";
+        // it occurs BEFORE the sensitive ToolResult and shouldn't be touched.
+        let chain = chain_with_pii(json!({ "ssn": "111-22-3333" }));
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::ReplaceFixed {
+                marker: "[REDACTED]".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        assert!(
+            contains(&s, "I'll look them up."),
+            "messages before the first sensitive ToolResult must not be redacted"
+        );
+    }
+
+    #[test]
+    fn user_role_messages_are_never_redacted_even_after_sensitive_tool() {
+        // Manually build a chain with a user-role message AFTER the
+        // sensitive ToolResult (simulating a multi-turn conversation
+        // where the user adds info post-lookup).
+        let mut chain = chain_with_pii(json!({ "ssn": "111-22-3333" }));
+        let parent = chain.last().unwrap().id.clone();
+        chain.push(step(
+            Some(parent),
+            StepKind::Message {
+                role: "user".into(),
+                content: "Continue with that record.".into(),
+            },
+        ));
+        let view = cloud_view(
+            &chain,
+            &RedactionPolicy::ReplaceFixed {
+                marker: "[REDACTED]".into(),
+            },
+            &sensitive(),
+        );
+        let s = serialize(&view);
+        assert!(
+            contains(&s, "Continue with that record."),
+            "user-role messages must always pass through verbatim"
+        );
+    }
+
+    // ---- Cache stability with the expanded redaction surface --------------
+
+    #[test]
+    fn replace_fixed_full_redaction_is_cross_run_cache_stable() {
+        // Two runs with different PII in EVERY leak path (input, output,
+        // echoed message). The redacted view must be byte-identical
+        // because every redactable surface goes to the same fixed marker.
+        let chain_run1 = {
+            let mut c = chain_with_pii_echoed_in_message("SSN-111-22-3333");
+            // Also stuff PII into the ToolCall.input.
+            if let StepKind::ToolCall { input, .. } = &mut c[2].kind {
+                *input = json!({ "id": 42, "verify_ssn": "SSN-111-22-3333" });
+            }
+            c
+        };
+        let chain_run2 = {
+            let mut c = chain_with_pii_echoed_in_message("SSN-999-88-7777");
+            if let StepKind::ToolCall { input, .. } = &mut c[2].kind {
+                *input = json!({ "id": 42, "verify_ssn": "SSN-999-88-7777" });
+            }
+            c
+        };
+        let policy = RedactionPolicy::ReplaceFixed {
+            marker: "[REDACTED]".into(),
+        };
+        let v1 = serialize(&cloud_view(&chain_run1, &policy, &sensitive()));
+        let v2 = serialize(&cloud_view(&chain_run2, &policy, &sensitive()));
+        assert_eq!(
+            v1, v2,
+            "full-surface redaction must produce byte-identical bytes across runs"
+        );
+    }
+
+    #[test]
+    fn replace_fixed_full_redaction_is_within_run_cache_stable() {
+        let chain_a = chain_with_pii_echoed_in_message("SSN-111-22-3333");
+        let chain_b = extend_chain(
+            chain_a.clone(),
+            StepKind::Message {
+                role: "assistant".into(),
+                content: "follow up".into(),
+            },
+        );
+        let policy = RedactionPolicy::ReplaceFixed {
+            marker: "[REDACTED]".into(),
+        };
+        let v_a = serialize(&cloud_view(&chain_a, &policy, &sensitive()));
+        let v_b = serialize(&cloud_view(&chain_b, &policy, &sensitive()));
+        assert!(
+            v_b.starts_with(&v_a),
+            "extended chain must preserve the redacted prefix verbatim"
         );
     }
 
